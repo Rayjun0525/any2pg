@@ -1,0 +1,11 @@
+# Sample configuration for any2pg
+# Number of attempts to resolve validation or execution errors
+max_rounds: 3
+
+execute:
+  enabled: false
+  dsn: postgresql://user:pass@host/db
+
+meta:
+  enabled: false
+  path: meta.json
