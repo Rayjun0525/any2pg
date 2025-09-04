@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 import json
+import logging
 import psycopg
 from autogen import AssistantAgent
 
@@ -25,8 +26,11 @@ class BaseAgent:
         )
 
     def run(self, prompt: str) -> str:
-        """Generate a response from the underlying LLM."""
-        reply = self.agent.generate_reply(messages=[{"role": "user", "content": prompt}])
+        try:
+            reply = self.agent.generate_reply(messages=[{"role": "user", "content": prompt}])
+        except Exception as exc:
+            logging.getLogger("any2pg").error("Agent %s failed: %s", self.name, exc)
+            raise
         if isinstance(reply, dict):
             return reply.get("content", "")
         return str(reply)
