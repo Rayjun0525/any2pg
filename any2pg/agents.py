@@ -26,7 +26,10 @@ class BaseAgent:
 
     def run(self, prompt: str) -> str:
         """Generate a response from the underlying LLM."""
-        return self.agent.generate_response(prompt)
+        reply = self.agent.generate_reply(messages=[{"role": "user", "content": prompt}])
+        if isinstance(reply, dict):
+            return reply.get("content", "")
+        return str(reply)
 
 
 class SemanticAnalysisAgent(BaseAgent):
