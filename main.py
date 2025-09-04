@@ -26,6 +26,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         help="YAML configuration file for execution and meta options",
     )
+    parser.add_argument(
+        "-p",
+        "--progress",
+        action="store_true",
+        help="Show progress while converting files",
+    )
+    parser.add_argument(
+        "--log-dir",
+        help="Directory to write conversion logs",
+    )
     return parser
 
 
@@ -41,7 +51,14 @@ def main() -> None:
     if args.config:
         with open(args.config, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
-    convert_directory(args.input, args.output, llm_config, config)
+    convert_directory(
+        args.input,
+        args.output,
+        llm_config,
+        config,
+        progress=args.progress,
+        log_dir=args.log_dir,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

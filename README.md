@@ -9,7 +9,7 @@ and [Ollama](https://ollama.ai) with the `gpt-oss:20b` model to translate SQL fi
 compatible queries.
 
 ```bash
-python main.py path/to/sql_dir path/to/output_dir --config config.yaml
+python main.py -p path/to/sql_dir path/to/output_dir --log-dir logs --config config.yaml
 ```
 
 Create a YAML configuration file to control execution, meta-pattern handling, and retry behaviour.
@@ -29,7 +29,8 @@ A sample configuration file is available as `config.sample.yaml`.
 The script will recursively search for `*.sql` files in the input directory, translate each file, and
 write the PostgreSQL version to the output directory. When `execute.enabled` is true the converted
 query is executed against PostgreSQL and the result or error is printed. When `meta.enabled` is true
-general SQL patterns are stored in `meta.path` to improve future translations.
+general SQL patterns are stored in `meta.path` to improve future translations. Use `-p` to display
+progress and `--log-dir` to save logs of the conversion process.
 
 Stored patterns are kept in a JSON file and automatically deduplicated:
 
