@@ -9,7 +9,7 @@ Hybrid SQL migration toolkit that converts heterogeneous SQL (Oracle/MySQL/etc.)
 - Config-first control: logging, adapters, verification options, and LLM settings are all driven by YAML.
 
 ## 2) Architecture at a Glance
-- **CLI (src/main.py):** `--init`, `--run`, `--reset-logs`, plus `--config` and `--db-file` overrides.
+- **CLI (src/main.py):** `--init`, `--run`, `--reset-logs`, plus `--config`, `--db-file`, `--log-level`, and `--log-file` overrides.
 - **Extractor (src/modules/metadata_extractor.py):** walks configured schemas via adapter instances, stores results in SQLite (`schema_objects`, `migration_logs`).
 - **RAG Context Builder (src/modules/context_builder.py):** parses SQL with SQLGlot, fetches related objects by name + schema from SQLite.
 - **Workflow (src/agents/workflow.py):** LangGraph-driven state machine for transpile ➜ review ➜ verify ➜ corrective rewrite.
@@ -46,7 +46,7 @@ python src/main.py --help
 cp sample/config.sample.yaml ./config.yaml
 
 # 3) Initialize metadata DB (override defaults if desired)
-python src/main.py --init --config config.yaml --db-file "./project_A.db"
+python src/main.py --init --config config.yaml --db-file "./project_A.db" --log-level DEBUG --log-file "./logs/any2pg.log"
 
 # 4) Run conversion (can resume after interruption)
 python src/main.py --run --config config.yaml --db-file "./project_A.db"
@@ -103,7 +103,7 @@ rules:                                # Free-form guidance strings for the revie
 - `sample/queries/*.sql`: three test queries (simple select, join+decode, function call) to validate the workflow. Copy them into `./input` for a dry run.
 
 ## 9) Logging & Troubleshooting
-- Tuning: adjust `logging.level` for verbosity; set `logging.file` empty to disable file output.
+- Tuning: adjust `logging.level` for verbosity or override via `--log-level` (or `ANY2PG_LOG_LEVEL`). File output path can be set per run with `--log-file` (`ANY2PG_LOG_FILE`) or in YAML; parent directories are created automatically when needed.
 - Targeted tracing: use `logging.module_levels` to crank up only the noisy components (e.g., `agents.workflow` for stage-by-stage traces, `modules.context_builder` for context queries).
 - Verification safety: verifier uses `autocommit=False` and always rolls back; tune `statement_timeout_ms` if long-running statements occur.
 - Adapter issues: most adapters rely on SQLAlchemy inspectors; missing dialect drivers will raise import/connection errors—install the correct driver for your source DB.
