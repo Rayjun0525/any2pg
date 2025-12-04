@@ -11,14 +11,14 @@ sqlglot>=20.0.0
 sqlalchemy>=2.0.0
 psycopg[binary]>=3.1.0    # Target DB (PostgreSQL) Driver
 cx_Oracle>=8.3.0          # Source DB (Oracle) Driver
-# oracledb>=2.0.0         # (Option) cx_Oracle의 최신 대안, 필요시 교체 가능
+# oracledb>=2.0.0         # Optional modern replacement for cx_Oracle
 
 # Utilities
 pyyaml>=6.0
 pydantic>=2.0.0
-tqdm>=4.65.0              # CLI 진행률 표시용
+tqdm>=4.65.0              # CLI progress bar
 
-pymssql>=2.2.0           # MS SQL Server (또는 pyodbc)
+pymssql>=2.2.0           # MS SQL Server (or pyodbc)
 sqlalchemy-hana>=0.5.0   # SAP HANA
 snowflake-sqlalchemy>=1.4.0 # Snowflake
 pymongo>=4.3.0           # MongoDB (NoSQL)
