@@ -31,12 +31,57 @@ def redact_dsn(dsn: str) -> str:
     except Exception:
         return "<redacted>"
 
+
+def expand_path(path: str) -> str:
+    """Expand environment variables and user-home shorthand inside a path."""
+
+    return os.path.expanduser(os.path.expandvars(path))
+
+
 def load_config(path="config.yaml"):
     if not os.path.exists(path):
         print(f"Config file not found: {path}", file=sys.stderr)
         sys.exit(1)
     with open(path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
+
+
+def validate_config(config: dict) -> dict:
+    """Validate required config keys and normalize paths for downstream use."""
+
+    required_sections = ("project", "database", "llm")
+    for section in required_sections:
+        if section not in config or not isinstance(config[section], dict):
+            raise ValueError(f"Missing required config section: {section}")
+
+    project = config["project"]
+    for key in ("source_dir", "target_dir", "db_file", "max_retries"):
+        if key not in project:
+            raise ValueError(f"project.{key} is required")
+
+    try:
+        project["max_retries"] = int(project["max_retries"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("project.max_retries must be an integer") from exc
+
+    if project["max_retries"] < 1:
+        raise ValueError("project.max_retries must be >= 1")
+
+    project["source_dir"] = expand_path(project["source_dir"])
+    project["target_dir"] = expand_path(project["target_dir"])
+    project["db_file"] = expand_path(project["db_file"])
+
+    database = config["database"]
+    for side in ("source", "target"):
+        if side not in database:
+            raise ValueError(f"database.{side} configuration is required")
+        if "uri" not in database[side]:
+            raise ValueError(f"database.{side}.uri is required")
+
+    logging_conf = config.setdefault("logging", {})
+    logging_conf["file"] = expand_path(logging_conf.get("file", ""))
+
+    return config
 
 
 def configure_logging(config: dict):
@@ -128,7 +173,10 @@ def run_migration(config):
     source_dir = config['project']['source_dir']
     target_dir = config['project']['target_dir']
     db_path = config['project']['db_file']
-    
+
+    if not os.path.isdir(source_dir):
+        raise FileNotFoundError(f"Configured source_dir does not exist: {source_dir}")
+
     if not os.path.exists(target_dir):
         os.makedirs(target_dir)
 
@@ -293,6 +341,7 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     apply_logging_overrides(config, args)
+    config = validate_config(config)
     configure_logging(config)
 
     # Allow CLI override of SQLite path without editing YAML

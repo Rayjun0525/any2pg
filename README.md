@@ -108,12 +108,20 @@ rules:                                # Free-form guidance strings for the revie
 - Verification safety: verifier uses `autocommit=False` and always rolls back; tune `statement_timeout_ms` if long-running statements occur.
 - Adapter issues: most adapters rely on SQLAlchemy inspectors; missing dialect drivers will raise import/connection errors—install the correct driver for your source DB.
 - Resume logic: if a file remains in `FAILED`/`VERIFY_FAIL`, inspect `migration_logs.last_error_msg` and increase `project.max_retries` if needed.
+- Config validation: startup enforces required keys (`project.*`, `database.{source,target}.uri`, `llm.*`) and rejects `max_retries < 1` so misconfigured runs fail fast with actionable errors.
+- Deterministic context: the RAG context builder orders schema objects consistently (`schema_name`, `obj_type`, `obj_name`) so reviewer prompts are reproducible across runs.
 
-## 10) Developer Notes
+## 10) Quality Gates & Testing
+- Defensive config validation (paths expanded, retries coerced to integer, required keys enforced) guards against accidental misconfiguration.
+- SQLite operations are fully transactional—write operations roll back on errors to avoid partially persisted metadata.
+- RAG context builder ignores unparsable SQL safely and only emits objects that provide DDL/source text.
+- Run the full suite locally with `python -m pytest`; set `POSTGRES_TEST_DSN` to enable live PostgreSQL smoke tests.
+
+## 11) Developer Notes
 - Primary code lives under `src/modules/` (metadata_extractor, context_builder, postgres_verifier, adapters). LangGraph workflow and prompts sit under `src/agents/`.
 - Backward compatibility shims: `src/context_builder_shim.py` and `src/postgres_verifier_shim.py` re-export their implementations—new code should import from `src/modules/` paths directly.
 - All comments/docstrings are in English for consistency; user-facing CLI messages remain bilingual where helpful.
 
-## 11) Live Database Verification (PostgreSQL / Oracle)
+## 12) Live Database Verification (PostgreSQL / Oracle)
 - PostgreSQL smoke tests: set `POSTGRES_TEST_DSN` (e.g., `postgresql://user:pass@localhost:5432/any2pg_test`) and run `python -m pytest -q` to execute the `tests/integration/test_postgres_live.py` suite. The verifier runs inside a transaction and rolls back every statement.
 - Oracle smoke tests: an Oracle instance is required but not bundled; set `ORACLE_TEST_DSN` and add analogous fixtures before enabling end-to-end Oracle checks.
