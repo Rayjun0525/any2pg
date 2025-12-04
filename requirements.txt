@@ -1,3 +1,0 @@
-autogen
-psycopg[binary]
-pyyaml
