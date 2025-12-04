@@ -14,6 +14,7 @@ class MetadataExtractor:
 
         source_conf = self.config["database"]["source"]
         self.adapter = get_adapter(source_conf)
+        self.project_name = self.config["project"]["name"]
         # schemas may be None/empty meaning default schema for connection
         self.schemas: List[Optional[str]] = source_conf.get("schemas") or [None]
 
@@ -47,14 +48,15 @@ class MetadataExtractor:
                 for obj in all_objects:
                     cur.execute(
                         """
-                        INSERT INTO schema_objects (schema_name, obj_name, obj_type, ddl_script, source_code)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(schema_name, obj_name, obj_type)
+                        INSERT INTO schema_objects (project_name, schema_name, obj_name, obj_type, ddl_script, source_code)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(project_name, schema_name, obj_name, obj_type)
                             DO UPDATE SET ddl_script=excluded.ddl_script,
                                           source_code=excluded.source_code,
                                           extracted_at=CURRENT_TIMESTAMP
                         """,
                         (
+                            self.project_name,
                             schema_label,
                             obj["name"].upper(),
                             obj["type"].upper(),

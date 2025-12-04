@@ -28,12 +28,17 @@ class FakeCursor:
     def __init__(self, error_after=None):
         self.error_after = error_after or {}
         self.statements_executed = []
+        self.user_statement_count = 0
 
     def execute(self, statement):
-        idx = len(self.statements_executed) + 1
+        normalized = statement.strip().upper()
         self.statements_executed.append(statement)
-        if idx in self.error_after:
-            raise self.error_after[idx]
+        if normalized == "BEGIN":
+            return
+
+        self.user_statement_count += 1
+        if self.user_statement_count in self.error_after:
+            raise self.error_after[self.user_statement_count]
 
     def __enter__(self):
         return self
@@ -64,7 +69,7 @@ class FakeConnection:
 def make_config(**target_overrides):
     target = {"uri": "postgresql://user:pass@localhost/db"}
     target.update(target_overrides)
-    return {"database": {"target": target}}
+    return {"database": {"target": target}, "verification": {}}
 
 
 def test_split_statements_returns_normalized_sql():
@@ -90,13 +95,15 @@ def test_verify_sql_executes_all_statements_and_rolls_back(monkeypatch):
     )
     verifier = VerifierAgent(make_config())
 
-    success, error_msg = verifier.verify_sql("select 1; select 2;")
+    result = verifier.verify_sql("select 1; select 2;")
 
-    assert success is True
-    assert error_msg is None
+    assert result.success is True
+    assert result.error is None
+    assert result.executed_statements == 2
+    assert result.skipped_statements == []
     assert connection.autocommit is False
     assert connection.rollback_called is True
-    assert cursor.statements_executed == ["SELECT 1", "SELECT 2"]
+    assert cursor.statements_executed == ["BEGIN", "SELECT 1", "SELECT 2"]
 
 
 def test_verify_sql_reports_db_error_with_context(monkeypatch):
@@ -111,12 +118,12 @@ def test_verify_sql_reports_db_error_with_context(monkeypatch):
     )
     verifier = VerifierAgent(make_config())
 
-    success, error_msg = verifier.verify_sql("select 1; select 2;")
+    result = verifier.verify_sql("select 1; select 2;")
 
-    assert success is False
-    assert "Statement #2 failed: bad" in error_msg
-    assert "Context: line 1" in error_msg
-    assert "SQL: SELECT 2" in error_msg
+    assert result.success is False
+    assert "Statement #2 failed: bad" in result.error
+    assert "Context: line 1" in result.error
+    assert "SQL: SELECT 2" in result.error
 
 
 def test_verify_sql_falls_back_to_string_message(monkeypatch):
@@ -128,7 +135,24 @@ def test_verify_sql_falls_back_to_string_message(monkeypatch):
     )
     verifier = VerifierAgent(make_config())
 
-    success, error_msg = verifier.verify_sql("select 1;")
+    result = verifier.verify_sql("select 1;")
 
-    assert success is False
-    assert "unstructured failure" in error_msg
+    assert result.success is False
+    assert "unstructured failure" in result.error
+
+
+def test_verify_sql_skips_dangerous_by_default(monkeypatch):
+    cursor = FakeCursor()
+    connection = FakeConnection(cursor)
+    monkeypatch.setattr(
+        psycopg, "connect", lambda dsn, **kwargs: connection
+    )
+    verifier = VerifierAgent(make_config())
+
+    result = verifier.verify_sql("DROP TABLE foo; SELECT 1;")
+
+    assert result.success is True
+    assert [stmt.upper() for stmt in result.skipped_statements] == ["DROP TABLE FOO"]
+    assert result.executed_statements == 1
+    assert "Data parity" in (result.notes or "")
+    assert cursor.statements_executed == ["BEGIN", "SELECT 1"]

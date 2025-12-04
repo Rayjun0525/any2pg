@@ -1,4 +1,5 @@
 project:
+  name: "sample_project"              # Label used to scope rows inside SQLite
   source_dir: "./sample/queries"        # Sample SQL inputs packaged with the repo
   target_dir: "./output"                # Converted outputs will be written here
   db_file: "./sample/migration.sample.db" # SQLite metadata cache for this sample run
@@ -28,6 +29,11 @@ llm:
   model: "gemma:7b"
   base_url: "http://localhost:11434"
   temperature: 0.2
+
+verification:
+  mode: "port"                          # metadata | port | report
+  allow_dangerous_statements: false      # do not run DROP/INSERT/etc during verification unless explicitly allowed
+  allow_procedure_execution: false       # block CALL/DO/EXECUTE during verification unless turned on
 
 rules:
   - "Prefer COALESCE over NVL when targeting PostgreSQL."

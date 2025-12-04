@@ -24,6 +24,9 @@ class AgentState(TypedDict):
     error_msg: Optional[str]
     retry_count: int
     rag_context: Optional[str]
+    schema_refs: Optional[list[str]]
+    skipped_statements: Optional[list[str]]
+    executed_statements: int
 
 
 class MigrationWorkflow:
@@ -114,18 +117,31 @@ class MigrationWorkflow:
     def verifier_node(self, state: AgentState):
         logger.info(f"[{state['file_path']}] Verifying in DB...")
 
-        success, error = self.verifier.verify_sql(state["target_sql"])
+        result = self.verifier.verify_sql(state["target_sql"])
 
-        if success:
-            return {"status": "DONE", "error_msg": None}
-        return {"status": "VERIFY_FAIL", "error_msg": error}
+        if result.success:
+            return {
+                "status": "DONE",
+                "error_msg": result.notes,
+                "skipped_statements": result.skipped_statements,
+                "executed_statements": result.executed_statements,
+            }
+        return {
+            "status": "VERIFY_FAIL",
+            "error_msg": result.error,
+            "skipped_statements": result.skipped_statements,
+            "executed_statements": result.executed_statements,
+        }
 
     def converter_node(self, state: AgentState):
         logger.info(f"[{state['file_path']}] Converting (Retry {state['retry_count'] + 1})...")
 
         context = state.get("rag_context")
+        schema_refs = state.get("schema_refs") or []
         if not context:
-            context = self.rag.get_context(state["source_sql"])
+            ctx_result = self.rag.build_context(state["source_sql"])
+            context = ctx_result.context
+            schema_refs = sorted(ctx_result.referenced_schemas)
 
         prompt = CONVERTER_SYSTEM_PROMPT.format(
             rag_context=context,
@@ -160,6 +176,7 @@ class MigrationWorkflow:
             "target_sql": normalized_sql,
             "retry_count": state["retry_count"] + 1,
             "rag_context": context,
+            "schema_refs": schema_refs,
         }
 
     @staticmethod

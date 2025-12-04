@@ -4,13 +4,13 @@ import yaml
 import argparse
 import logging
 from logging.handlers import RotatingFileHandler
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 from tqdm import tqdm
 
 from modules.sqlite_store import DBManager
 from modules.metadata_extractor import MetadataExtractor
-from modules.context_builder import RAGContextBuilder
+from modules.context_builder import ContextResult, RAGContextBuilder
 from modules.postgres_verifier import VerifierAgent
 from agents.workflow import MigrationWorkflow
 
@@ -31,12 +31,66 @@ def redact_dsn(dsn: str) -> str:
     except Exception:
         return "<redacted>"
 
+
+def expand_path(path: str) -> str:
+    """Expand environment variables and user-home shorthand inside a path."""
+
+    return os.path.expanduser(os.path.expandvars(path))
+
+
 def load_config(path="config.yaml"):
     if not os.path.exists(path):
         print(f"Config file not found: {path}", file=sys.stderr)
         sys.exit(1)
     with open(path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
+
+
+def validate_config(config: dict) -> dict:
+    """Validate required config keys and normalize paths for downstream use."""
+
+    required_sections = ("project", "database", "llm")
+    for section in required_sections:
+        if section not in config or not isinstance(config[section], dict):
+            raise ValueError(f"Missing required config section: {section}")
+
+    project = config["project"]
+    for key in ("name", "source_dir", "target_dir", "db_file", "max_retries"):
+        if key not in project:
+            raise ValueError(f"project.{key} is required")
+
+    try:
+        project["max_retries"] = int(project["max_retries"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("project.max_retries must be an integer") from exc
+
+    if project["max_retries"] < 1:
+        raise ValueError("project.max_retries must be >= 1")
+
+    project["name"] = str(project["name"]).strip()
+    if not project["name"]:
+        raise ValueError("project.name must be a non-empty string")
+
+    project["source_dir"] = expand_path(project["source_dir"])
+    project["target_dir"] = expand_path(project["target_dir"])
+    project["db_file"] = expand_path(project["db_file"])
+
+    database = config["database"]
+    for side in ("source", "target"):
+        if side not in database:
+            raise ValueError(f"database.{side} configuration is required")
+        if "uri" not in database[side]:
+            raise ValueError(f"database.{side}.uri is required")
+
+    logging_conf = config.setdefault("logging", {})
+    logging_conf["file"] = expand_path(logging_conf.get("file", ""))
+
+    verification_conf = config.setdefault("verification", {})
+    verification_conf.setdefault("allow_dangerous_statements", False)
+    verification_conf.setdefault("allow_procedure_execution", False)
+    verification_conf.setdefault("mode", "port")
+
+    return config
 
 
 def configure_logging(config: dict):
@@ -101,26 +155,28 @@ def run_init(config):
     """Initialize SQLite storage and extract source metadata."""
     db_path = config['project']['db_file']
     source_conf = config["database"]["source"]
+    project_name = config["project"]["name"]
     logger.info(
         "Initializing system (db_file=%s, source=%s, uri=%s)",
         db_path,
         source_conf.get("type"),
         redact_dsn(source_conf.get("uri", "")),
     )
-    
-    db = DBManager(db_path)
+
+    db = DBManager(db_path, project_name=project_name)
     db.init_db()
-    
+
     extractor = MetadataExtractor(config, db)
     extractor.run()
 
 def run_reset_logs(config):
     """Clear migration log table for a clean retry."""
     db_path = config['project']['db_file']
+    project_name = config['project']['name']
     logger.info("Resetting logs for DB: %s", db_path)
-    db = DBManager(db_path)
+    db = DBManager(db_path, project_name=project_name)
     with db.get_cursor(commit=True) as cur:
-        cur.execute("DELETE FROM migration_logs")
+        cur.execute("DELETE FROM migration_logs WHERE project_name = ?", (project_name,))
     logger.info("Logs reset complete.")
 
 def run_migration(config):
@@ -128,20 +184,25 @@ def run_migration(config):
     source_dir = config['project']['source_dir']
     target_dir = config['project']['target_dir']
     db_path = config['project']['db_file']
-    
+    project_name = config['project']['name']
+
+    if not os.path.isdir(source_dir):
+        raise FileNotFoundError(f"Configured source_dir does not exist: {source_dir}")
+
     if not os.path.exists(target_dir):
         os.makedirs(target_dir)
 
-    db = DBManager(db_path)
+    db = DBManager(db_path, project_name=project_name)
     source_conf = config['database']['source']
     target_conf = config['database']['target']
     source_dialect = source_conf.get('type', 'oracle')
-    rag = RAGContextBuilder(db, source_dialect=source_dialect)
+    rag = RAGContextBuilder(db, source_dialect=source_dialect, project_name=project_name)
     verifier = VerifierAgent(config)
     workflow_engine = MigrationWorkflow(config, rag, verifier)
 
     logger.info(
-        "Run starting (source_dir=%s, target_dir=%s, db_file=%s, source=%s, target=%s)",
+        "Run starting (project=%s, source_dir=%s, target_dir=%s, db_file=%s, source=%s, target=%s)",
+        project_name,
         source_dir,
         target_dir,
         db_path,
@@ -159,7 +220,10 @@ def run_migration(config):
     with db.get_cursor() as cur:
         for fname in all_files:
             full_path = os.path.join(source_dir, fname)
-            cur.execute("SELECT status FROM migration_logs WHERE file_path = ?", (full_path,))
+            cur.execute(
+                "SELECT status FROM migration_logs WHERE project_name = ? AND file_path = ?",
+                (project_name, full_path),
+            )
             row = cur.fetchone()
             if row and row['status'] == 'DONE':
                 continue
@@ -181,9 +245,16 @@ def run_migration(config):
     for fname in tqdm(pending_files, desc="Processing Files"):
         file_path = os.path.join(source_dir, fname)
         output_path = os.path.join(target_dir, fname)
-        
+
         with open(file_path, 'r', encoding='utf-8') as f:
             source_sql = f.read()
+
+        ctx_result: Optional[ContextResult] = None
+        try:
+            ctx_result = rag.build_context(source_sql)
+        except Exception:
+            logger.warning("[%s] Failed to pre-compute context; continuing", fname)
+            ctx_result = None
 
         initial_state = {
             "file_path": file_path,
@@ -192,7 +263,10 @@ def run_migration(config):
             "status": "PENDING",
             "error_msg": None,
             "retry_count": 0,
-            "rag_context": None
+            "rag_context": (ctx_result.context if ctx_result and ctx_result.context else None),
+            "schema_refs": sorted(ctx_result.referenced_schemas) if ctx_result else [],
+            "skipped_statements": [],
+            "executed_statements": 0,
         }
 
         try:
@@ -213,22 +287,34 @@ def run_migration(config):
                     final_state['error_msg'],
                 )
 
+            detected_schemas = sorted(set(final_state.get("schema_refs") or []))
+            schemas_text = ",".join(detected_schemas) if detected_schemas else None
+            skipped = final_state.get("skipped_statements") or []
+            skipped_blob = "\n".join(skipped) if skipped else None
+
             with db.get_cursor(commit=True) as cur:
                 cur.execute("""
-                    INSERT INTO migration_logs (file_path, status, retry_count, last_error_msg, target_path)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(file_path) DO UPDATE SET
+                    INSERT INTO migration_logs (project_name, file_path, detected_schemas, status, retry_count, last_error_msg, target_path, skipped_statements, executed_statements)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_name, file_path) DO UPDATE SET
+                        detected_schemas = excluded.detected_schemas,
                         status = excluded.status,
                         retry_count = excluded.retry_count,
                         last_error_msg = excluded.last_error_msg,
                         target_path = excluded.target_path,
+                        skipped_statements = excluded.skipped_statements,
+                        executed_statements = excluded.executed_statements,
                         updated_at = CURRENT_TIMESTAMP
                 """, (
+                    project_name,
                     final_state['file_path'],
+                    schemas_text,
                     final_state['status'],
                     final_state['retry_count'],
                     final_state['error_msg'],
-                    output_path if final_state['status'] == 'DONE' else None
+                    output_path if final_state['status'] == 'DONE' else None,
+                    skipped_blob,
+                    final_state.get('executed_statements', 0),
                 ))
         except Exception:
             logger.exception("[%s] Critical error processing file", fname)
@@ -238,27 +324,91 @@ def run_migration(config):
         f"Run summary: {done} succeeded, {failed} failed/incomplete out of {len(pending_files)} pending files"
     )
 
+
+
+def run_report(config, schema_filter: Optional[str] = None, status_filter: Optional[str] = None):
+    """Print a migration report filtered by project, schema, and status."""
+
+    db_path = config['project']['db_file']
+    project_name = config['project']['name']
+    logger.info("Loading report from %s for project %s", db_path, project_name)
+
+    db = DBManager(db_path, project_name=project_name)
+    base_sql = (
+        "SELECT file_path, detected_schemas, status, retry_count, executed_statements, "
+        "skipped_statements, last_error_msg, target_path, updated_at "
+        "FROM migration_logs WHERE project_name = ?"
+    )
+    params: List = [project_name]
+
+    if schema_filter:
+        base_sql += " AND detected_schemas LIKE ?"
+        params.append(f"%{schema_filter.upper()}%")
+
+    if status_filter:
+        base_sql += " AND status = ?"
+        params.append(status_filter)
+
+    base_sql += " ORDER BY updated_at DESC"
+
+    with db.get_cursor() as cur:
+        cur.execute(base_sql, params)
+        rows = cur.fetchall()
+
+    if not rows:
+        print("No records found for the given filters.")
+        return
+
+    print("\n=== Migration Report ===")
+    print(f"Project: {project_name}")
+    if schema_filter:
+        print(f"Schema filter: {schema_filter}")
+    if status_filter:
+        print(f"Status filter: {status_filter}")
+    print("-----------------------")
+
+    for row in rows:
+        print(f"File: {row['file_path']}")
+        print(f"  Schemas: {row['detected_schemas'] or 'N/A'}")
+        print(f"  Status: {row['status']} (retries={row['retry_count']})")
+        print(f"  Executed: {row['executed_statements']} | Skipped: {bool(row['skipped_statements'])}")
+        if row['target_path']:
+            print(f"  Target: {row['target_path']}")
+        if row['last_error_msg']:
+            print(f"  Notes/Error: {row['last_error_msg']}")
+        if row['skipped_statements']:
+            print("  Skipped statements:\n    " + "\n    ".join(row['skipped_statements'].split("\n")))
+        print(f"  Updated at: {row['updated_at']}")
+        print("-----------------------")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Any2PG: Hybrid SQL Migration Tool",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python src/main.py --init --config config.yaml\n"
-            "  python src/main.py --run --db-file project_A.db\n"
-            "  python src/main.py --reset-logs --db-file project_A.db\n"
+            "  python src/main.py --mode metadata --config config.yaml\n"
+            "  python src/main.py --mode port --db-file project_A.db\n"
+            "  python src/main.py --mode report --schema-filter HR --db-file project_A.db\n"
             "All behavior is controlled via the YAML config; CLI flags only select the operation and override the DB file."
         ),
     )
     parser.add_argument(
+        '--mode',
+        choices=['metadata', 'port', 'report'],
+        default=None,
+        help="Select the operation mode (metadata extraction, porting, or report display)",
+    )
+    parser.add_argument(
         '--init',
         action='store_true',
-        help="Initialize SQLite storage and extract source DB metadata",
+        help="Initialize SQLite storage and extract source DB metadata (alias for --mode metadata)",
     )
     parser.add_argument(
         '--run',
         action='store_true',
-        help="Run the migration workflow for SQL files in project.source_dir",
+        help="Run the migration workflow for SQL files in project.source_dir (alias for --mode port)",
     )
     parser.add_argument(
         '--reset-logs',
@@ -289,24 +439,45 @@ def main():
         default=None,
         help="Override logging.file path from config (empty string disables file handler)",
     )
+    parser.add_argument(
+        '--schema-filter',
+        type=str,
+        default=None,
+        help="Filter report rows by schema substring (report mode only)",
+    )
+    parser.add_argument(
+        '--status-filter',
+        type=str,
+        default=None,
+        help="Filter report rows by status (report mode only)",
+    )
 
     args = parser.parse_args()
     config = load_config(args.config)
     apply_logging_overrides(config, args)
+    config = validate_config(config)
     configure_logging(config)
 
     # Allow CLI override of SQLite path without editing YAML
     if args.db_file:
         config['project']['db_file'] = args.db_file
 
+    mode = args.mode or config.get("verification", {}).get("mode", "port")
     if args.init:
-        run_init(config)
-    elif args.reset_logs:
-        run_reset_logs(config)
+        mode = "metadata"
     elif args.run:
-        run_migration(config)
+        mode = "port"
+
+    if args.reset_logs:
+        run_reset_logs(config)
+        return
+
+    if mode == "metadata":
+        run_init(config)
+    elif mode == "report":
+        run_report(config, schema_filter=args.schema_filter, status_filter=args.status_filter)
     else:
-        parser.print_help()
+        run_migration(config)
 
 
 if __name__ == "__main__":

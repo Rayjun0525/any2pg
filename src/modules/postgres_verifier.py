@@ -1,21 +1,34 @@
 import logging
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import psycopg
 import sqlglot
 from urllib.parse import urlsplit, urlunsplit
+from sqlglot import exp
 from sqlglot.errors import ParseError
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class VerificationResult:
+    success: bool
+    error: Optional[str]
+    skipped_statements: List[str] = field(default_factory=list)
+    executed_statements: int = 0
+    notes: Optional[str] = None
 
 
 class VerifierAgent:
     def __init__(self, config: dict):
         """Create a verifier using the target DB configuration from config.yaml."""
         self.target_dsn = config["database"]["target"]["uri"]
-        self.statement_timeout_ms = config["database"]["target"].get(
-            "statement_timeout_ms"
-        )
+        target_conf = config["database"]["target"]
+        verification_conf = config.get("verification", {})
+        self.statement_timeout_ms = target_conf.get("statement_timeout_ms")
+        self.allow_dangerous = verification_conf.get("allow_dangerous_statements", False)
+        self.allow_procedures = verification_conf.get("allow_procedure_execution", False)
 
     @staticmethod
     def _redact_dsn(dsn: str) -> str:
@@ -30,16 +43,36 @@ class VerifierAgent:
         except Exception:
             return "<redacted>"
 
-    def verify_sql(self, sql_script: str) -> Tuple[bool, Optional[str]]:
+    def verify_sql(self, sql_script: str) -> VerificationResult:
         """Simulate execution of converted SQL on the target database."""
         if not sql_script or not sql_script.strip():
-            return False, "Empty SQL script"
+            return VerificationResult(False, "Empty SQL script")
 
         try:
             statements = self._split_statements(sql_script)
+            parsed = sqlglot.parse(sql_script, read="postgres")
         except ValueError as parse_err:
             logger.warning("Unable to split SQL script: %s", parse_err)
-            return False, str(parse_err)
+            return VerificationResult(False, str(parse_err))
+
+        executable: list[str] = []
+        skipped: list[str] = []
+        for raw, stmt in zip(statements, parsed):
+            classification = self._classify_statement(stmt)
+            if classification == "procedure" and not self.allow_procedures:
+                skipped.append(raw)
+                continue
+            if classification == "dangerous" and not self.allow_dangerous:
+                skipped.append(raw)
+                continue
+            executable.append(raw)
+
+        if not executable and skipped:
+            note = (
+                "All statements skipped due to verification safety settings; "
+                "functional data checks must be done manually."
+            )
+            return VerificationResult(True, None, skipped_statements=skipped, notes=note)
 
         conn_args = {}
         if self.statement_timeout_ms:
@@ -57,14 +90,27 @@ class VerifierAgent:
                 with conn.cursor() as cur:
                     failing_idx = None
                     failing_stmt = None
+                    executed = 0
                     try:
-                        for idx, statement in enumerate(statements, start=1):
+                        cur.execute("BEGIN")
+                        for idx, statement in enumerate(executable, start=1):
                             failing_idx = idx
                             failing_stmt = statement
                             logger.debug("Executing statement %d: %s", idx, statement)
                             cur.execute(statement)
-                        logger.info("Verification passed (Transaction will be rolled back).")
-                        return True, None
+                            executed += 1
+                        logger.info(
+                            "Verification passed (Transaction will be rolled back). Executed %d statements; skipped %d.",
+                            executed,
+                            len(skipped),
+                        )
+                        return VerificationResult(
+                            True,
+                            None,
+                            skipped_statements=skipped,
+                            executed_statements=executed,
+                            notes="Data parity is not validated; please run your own comparisons.",
+                        )
                     except psycopg.Error as db_err:
                         diag = getattr(db_err, "diag", None)
                         primary = getattr(diag, "message_primary", None) if diag else None
@@ -79,12 +125,17 @@ class VerifierAgent:
                         if failing_stmt:
                             error_msg += f" | SQL: {failing_stmt}"
                         logger.warning("Verification failed: %s", error_msg)
-                        return False, error_msg
+                        return VerificationResult(
+                            False,
+                            error_msg,
+                            skipped_statements=skipped,
+                            executed_statements=executed,
+                        )
                     finally:
                         conn.rollback()
         except Exception as e:
             logger.error(f"Verification system error: {e}")
-            return False, str(e)
+            return VerificationResult(False, str(e))
 
     def _split_statements(self, sql_script: str) -> list[str]:
         try:
@@ -96,3 +147,44 @@ class VerifierAgent:
         if not statements:
             raise ValueError("No executable statements found in SQL script")
         return statements
+
+    def _classify_statement(self, stmt: sqlglot.Expression) -> str:
+        """Return classification: safe, dangerous, or procedure."""
+
+        dangerous_nodes = tuple(
+            node
+            for node in (
+                getattr(exp, "Create", None),
+                getattr(exp, "Alter", None),
+                getattr(exp, "Drop", None),
+                getattr(exp, "Insert", None),
+                getattr(exp, "Update", None),
+                getattr(exp, "Delete", None),
+                getattr(exp, "Merge", None),
+                getattr(exp, "Command", None),
+            )
+            if node
+        )
+
+        procedure_nodes = tuple(
+            node for node in (getattr(exp, "Call", None), getattr(exp, "Procedure", None)) if node
+        )
+        if procedure_nodes and isinstance(stmt, procedure_nodes):
+            return "procedure"
+
+        if isinstance(stmt, dangerous_nodes):
+            # Treat DO blocks and raw commands as procedures when they encapsulate code
+            if isinstance(stmt, exp.Command):
+                token = (stmt.this.sql().upper() if getattr(stmt, "this", None) else "")
+                if token in {"CALL", "EXEC", "EXECUTE", "DO"}:
+                    return "procedure"
+            return "dangerous"
+
+        leading = stmt.sql(dialect="postgres").strip().upper()
+        if leading.startswith(("CALL ", "EXEC ", "EXECUTE ", "DO ")):
+            return "procedure"
+
+        if leading.startswith(("INSERT", "UPDATE", "DELETE", "TRUNCATE", "DROP", "ALTER", "CREATE")):
+            return "dangerous"
+
+        return "safe"
