@@ -1,0 +1,29 @@
+project:
+  source_dir: "./input"
+  target_dir: "./output"
+  db_file: "./migration.db"      # 기본값 (CLI 실행 시 --db-file로 덮어씌워짐)
+  max_retries: 5
+
+database:
+  source: 
+    type: "oracle"
+    uri: "oracle+oracledb://username:password@localhost:1521/?service_name=xe"
+    # [변경] 추출할 스키마 목록 (대소문자 정확히 기재)
+    # 비워두거나 이 줄을 없애면 접속 계정의 기본 스키마만 추출
+    schemas: ["HR", "SCOTT", "SALES"]
+    
+  target:
+    type: "postgres"
+    uri: "postgresql://username:password@localhost:5432/postgres"
+
+llm:
+  provider: "ollama"
+  model: "gemma:7b"
+  base_url: "http://localhost:11434"
+  temperature: 0.1
+
+rules:
+  - "Oracle의 NVL은 COALESCE로 변환하라."
+  - "날짜 연산은 PostgreSQL의 INTERVAL 문법을 사용하라."
+  - "DECODE 함수는 표준 SQL인 CASE WHEN 구문으로 변경하라."
+  - "SYSDATE는 CURRENT_TIMESTAMP로 변경하라."
