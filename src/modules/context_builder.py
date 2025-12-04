@@ -37,8 +37,15 @@ class RAGContextBuilder:
                     if table.name:
                         refs.add(table.name.upper())
                 for func in stmt.find_all(exp.Func):
-                    if func.sql_name():
-                        refs.add(func.sql_name().upper())
+                    func_name = func.sql_name() or ""
+                    if func_name.upper() == "ANONYMOUS":
+                        func_root = getattr(func, "this", None)
+                        if isinstance(func_root, str):
+                            func_name = func_root
+                        elif getattr(func_root, "name", None):
+                            func_name = func_root.name
+                    if func_name:
+                        refs.add(func_name.upper())
         except Exception as e:
             logger.warning(f"Failed to parse SQL for RAG context: {e}")
         return refs
@@ -52,6 +59,10 @@ class RAGContextBuilder:
             SELECT schema_name, obj_name, obj_type, ddl_script, source_code
             FROM schema_objects
             WHERE obj_name IN ({placeholders})
+            ORDER BY
+                CASE obj_type WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 ELSE 2 END,
+                schema_name,
+                obj_name
         """
 
         results: List[Dict] = []
