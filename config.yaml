@@ -1,20 +1,27 @@
 project:
   source_dir: "./input"
   target_dir: "./output"
-  db_file: "./migration.db"      # 기본값 (CLI 실행 시 --db-file로 덮어씌워짐)
+  db_file: "./migration.db"      # Default; can be overridden by --db-file
   max_retries: 5
 
+logging:
+  level: "INFO"                   # DEBUG, INFO, WARNING, ERROR
+  file: "./any2pg.log"           # Leave empty to log to console only
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  max_bytes: 1048576               # Rotate after ~1MB
+  backup_count: 3                  # Number of rotated files to keep
+
 database:
-  source: 
+  source:
     type: "oracle"
     uri: "oracle+oracledb://username:password@localhost:1521/?service_name=xe"
-    # [변경] 추출할 스키마 목록 (대소문자 정확히 기재)
-    # 비워두거나 이 줄을 없애면 접속 계정의 기본 스키마만 추출
+    # Schemas to extract (case sensitive). If omitted, only the default schema is used.
     schemas: ["HR", "SCOTT", "SALES"]
-    
+
   target:
     type: "postgres"
     uri: "postgresql://username:password@localhost:5432/postgres"
+    statement_timeout_ms: 5000     # Optional statement_timeout applied during verification
 
 llm:
   provider: "ollama"

@@ -1,0 +1,34 @@
+project:
+  source_dir: "./sample/queries"
+  target_dir: "./output"
+  db_file: "./sample/migration.sample.db"
+  max_retries: 3
+
+logging:
+  level: "INFO"
+  file: "./sample/any2pg.sample.log"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  max_bytes: 524288
+  backup_count: 2
+
+database:
+  source:
+    type: "oracle"
+    uri: "oracle+oracledb://username:password@localhost:1521/?service_name=xe"
+    schemas: ["HR", "SCOTT"]
+  target:
+    type: "postgres"
+    uri: "postgresql://username:password@localhost:5432/postgres"
+    statement_timeout_ms: 8000
+
+llm:
+  provider: "ollama"
+  model: "gemma:7b"
+  base_url: "http://localhost:11434"
+  temperature: 0.2
+
+rules:
+  - "Prefer COALESCE over NVL when targeting PostgreSQL."
+  - "Use PostgreSQL INTERVAL syntax for date arithmetic."
+  - "Replace DECODE with CASE expressions."
+  - "Map SYSDATE to CURRENT_TIMESTAMP."
