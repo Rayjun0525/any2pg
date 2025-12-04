@@ -6,6 +6,7 @@ from .base import BaseDBAdapter
 class MongoDBAdapter(BaseDBAdapter):
     def __init__(self, uri: str):
         self.client = MongoClient(uri)
+        super().__init__(self.client)
 
     def get_tables_and_views(self, schema: str | None = None) -> list[dict]:
         results = []
