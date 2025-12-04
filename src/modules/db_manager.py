@@ -1,10 +1,10 @@
-import sqlite3
 import logging
-import os
+import sqlite3
 from contextlib import contextmanager
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
 
 class DBManager:
     def __init__(self, db_path: str):
@@ -13,14 +13,14 @@ class DBManager:
     def get_connection(self):
         try:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row 
+            conn.row_factory = sqlite3.Row
             return conn
         except sqlite3.Error as e:
             logger.error(f"DB Connection failed: {e}")
             raise
 
     @contextmanager
-    def get_cursor(self, commit=False):
+    def get_cursor(self, commit: bool = False):
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
@@ -36,17 +36,16 @@ class DBManager:
             conn.close()
 
     def init_db(self):
-        """시스템 초기화: 스키마 컬럼 추가 및 복합키 설정"""
+        """Initialize tables and indexes for schema metadata and migration logs."""
         schema_objects_ddl = """
         CREATE TABLE IF NOT EXISTS schema_objects (
             obj_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            schema_name TEXT NOT NULL,    -- [추가] 스키마 구분용
+            schema_name TEXT NOT NULL,
             obj_name TEXT NOT NULL,
             obj_type TEXT NOT NULL,
             ddl_script TEXT,
             source_code TEXT,
             extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            -- [변경] 스키마명까지 포함하여 유니크 제약 설정
             UNIQUE(schema_name, obj_name, obj_type)
         );
         """
@@ -72,7 +71,7 @@ class DBManager:
                 cursor.execute(idx_schema_name)
                 cursor.execute(migration_logs_ddl)
                 cursor.execute(idx_log_status)
-                
+
             logger.info(f"Database initialized successfully at {self.db_path}")
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
