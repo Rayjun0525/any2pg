@@ -31,6 +31,13 @@ class MetadataExtractor:
         procedures = self.adapter.get_procedures(schema)
         all_objects: List[Dict] = tables_and_views + procedures
 
+        logger.debug(
+            "Schema %s -> %d tables/views, %d routines", 
+            schema_label,
+            len(tables_and_views),
+            len(procedures),
+        )
+
         if not all_objects:
             logger.warning(f"No objects found for schema {schema_label}")
             return

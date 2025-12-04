@@ -2,6 +2,7 @@ import logging
 from typing import Optional, Tuple
 
 import psycopg
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,19 @@ class VerifierAgent:
             "statement_timeout_ms"
         )
 
+    @staticmethod
+    def _redact_dsn(dsn: str) -> str:
+        try:
+            parts = urlsplit(dsn)
+            if parts.username:
+                safe_netloc = parts.hostname or ""
+                if parts.port:
+                    safe_netloc = f"{safe_netloc}:{parts.port}"
+                parts = parts._replace(netloc=safe_netloc)
+            return urlunsplit(parts)
+        except Exception:
+            return "<redacted>"
+
     def verify_sql(self, sql_script: str) -> Tuple[bool, Optional[str]]:
         """Simulate execution of converted SQL on the target database."""
         if not sql_script or not sql_script.strip():
@@ -22,6 +36,12 @@ class VerifierAgent:
         conn_args = {}
         if self.statement_timeout_ms:
             conn_args["options"] = f"-c statement_timeout={self.statement_timeout_ms}"
+
+        logger.info(
+            "Verifier connecting to target (uri=%s, timeout_ms=%s)",
+            self._redact_dsn(self.target_dsn),
+            self.statement_timeout_ms,
+        )
 
         try:
             with psycopg.connect(self.target_dsn, **conn_args) as conn:

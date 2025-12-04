@@ -23,6 +23,9 @@ class RAGContextBuilder:
         if not metadata_list:
             return ""
 
+        logger.debug(
+            "RAG context built for references: %s", ", ".join(sorted(referenced_names))
+        )
         return self._format_output(metadata_list)
 
     def _extract_references(self, sql: str) -> Set[str]:
@@ -66,6 +69,7 @@ class RAGContextBuilder:
                             "source": row["source_code"],
                         }
                     )
+                logger.debug("RAG fetch matched %d objects", len(results))
         except Exception as e:
             logger.error(f"Error fetching metadata: {e}")
         return results

@@ -65,6 +65,9 @@ project:
 
 logging:
   level: "INFO"                     # DEBUG, INFO, WARNING, ERROR
+  module_levels:                    # Optional per-module overrides for deep tracing
+    agents.workflow: "DEBUG"
+    modules.rag_engine: "DEBUG"
   file: "./any2pg.log"             # Empty string logs to console only
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   max_bytes: 1048576                # Rotate after ~1MB
@@ -101,6 +104,7 @@ rules:                                # Free-form guidance strings for the revie
 
 ## 9) Logging & Troubleshooting
 - Tuning: adjust `logging.level` for verbosity; set `logging.file` empty to disable file output.
+- Targeted tracing: use `logging.module_levels` to crank up only the noisy components (e.g., `agents.workflow` for stage-by-stage traces, `modules.rag_engine` for context queries).
 - Verification safety: verifier uses `autocommit=False` and always rolls back; tune `statement_timeout_ms` if long-running statements occur.
 - Adapter issues: most adapters rely on SQLAlchemy inspectors; missing dialect drivers will raise import/connection errors—install the correct driver for your source DB.
 - Resume logic: if a file remains in `FAILED`/`VERIFY_FAIL`, inspect `migration_logs.last_error_msg` and increase `project.max_retries` if needed.

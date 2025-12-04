@@ -4,6 +4,8 @@ import yaml
 import argparse
 import logging
 from logging.handlers import RotatingFileHandler
+from typing import Dict
+from urllib.parse import urlsplit, urlunsplit
 from tqdm import tqdm
 
 from modules.db_manager import DBManager
@@ -14,6 +16,20 @@ from agents.workflow import MigrationWorkflow
 
 logger = logging.getLogger("Any2PG")
 logger.addHandler(logging.NullHandler())
+
+
+def redact_dsn(dsn: str) -> str:
+    """Hide credentials inside a connection string for safe logging."""
+    try:
+        parts = urlsplit(dsn)
+        if parts.username:
+            safe_netloc = parts.hostname or ""
+            if parts.port:
+                safe_netloc = f"{safe_netloc}:{parts.port}"
+            parts = parts._replace(netloc=safe_netloc)
+        return urlunsplit(parts)
+    except Exception:
+        return "<redacted>"
 
 def load_config(path="config.yaml"):
     if not os.path.exists(path):
@@ -45,6 +61,11 @@ def configure_logging(config: dict):
         )
 
     logging.basicConfig(level=level, format=fmt, handlers=handlers, force=True)
+    module_levels: Dict[str, str] = logging_conf.get("module_levels", {})
+    for module_name, module_level in module_levels.items():
+        mod_logger = logging.getLogger(module_name)
+        mod_logger.setLevel(getattr(logging, module_level.upper(), level))
+
     logger.info(
         "Logging configured (level=%s, output=%s)",
         level_name,
@@ -54,7 +75,13 @@ def configure_logging(config: dict):
 def run_init(config):
     """Initialize SQLite storage and extract source metadata."""
     db_path = config['project']['db_file']
-    logger.info(f"Initializing System with DB: {db_path}")
+    source_conf = config["database"]["source"]
+    logger.info(
+        "Initializing system (db_file=%s, source=%s, uri=%s)",
+        db_path,
+        source_conf.get("type"),
+        redact_dsn(source_conf.get("uri", "")),
+    )
     
     db = DBManager(db_path)
     db.init_db()
@@ -65,7 +92,7 @@ def run_init(config):
 def run_reset_logs(config):
     """Clear migration log table for a clean retry."""
     db_path = config['project']['db_file']
-    logger.info(f"Resetting logs for DB: {db_path}")
+    logger.info("Resetting logs for DB: %s", db_path)
     db = DBManager(db_path)
     with db.get_cursor(commit=True) as cur:
         cur.execute("DELETE FROM migration_logs")
@@ -81,10 +108,21 @@ def run_migration(config):
         os.makedirs(target_dir)
 
     db = DBManager(db_path)
-    source_dialect = config['database']['source'].get('type', 'oracle')
+    source_conf = config['database']['source']
+    target_conf = config['database']['target']
+    source_dialect = source_conf.get('type', 'oracle')
     rag = RAGContextBuilder(db, source_dialect=source_dialect)
     verifier = VerifierAgent(config)
     workflow_engine = MigrationWorkflow(config, rag, verifier)
+
+    logger.info(
+        "Run starting (source_dir=%s, target_dir=%s, db_file=%s, source=%s, target=%s)",
+        source_dir,
+        target_dir,
+        db_path,
+        source_dialect,
+        target_conf.get('type', 'postgres'),
+    )
     
     all_files = [f for f in os.listdir(source_dir) if f.endswith('.sql')]
     if not all_files:
@@ -102,7 +140,13 @@ def run_migration(config):
                 continue
             pending_files.append(fname)
 
-    logger.info(f"Processing {len(pending_files)} / {len(all_files)} files using DB: {db_path}")
+    logger.info(
+        "Processing %d / %d files using DB: %s",
+        len(pending_files),
+        len(all_files),
+        db_path,
+    )
+    logger.debug("Pending files: %s", ", ".join(pending_files))
     
     done, failed = 0, 0
     for fname in tqdm(pending_files, desc="Processing Files"):
@@ -123,17 +167,21 @@ def run_migration(config):
         }
 
         try:
+            logger.info("[%s] Starting workflow", fname)
             final_state = workflow_engine.app.invoke(initial_state)
-            
+
             if final_state['status'] == 'DONE' and final_state['target_sql']:
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(final_state['target_sql'])
                 done += 1
-                logger.info(f"[{fname}] migration complete → {output_path}")
+                logger.info("[%s] Migration complete -> %s", fname, output_path)
             else:
                 failed += 1
                 logger.warning(
-                    f"[{fname}] status={final_state['status']} error={final_state['error_msg']}"
+                    "[%s] status=%s error=%s",
+                    fname,
+                    final_state['status'],
+                    final_state['error_msg'],
                 )
 
             with db.get_cursor(commit=True) as cur:
@@ -153,8 +201,8 @@ def run_migration(config):
                     final_state['error_msg'],
                     output_path if final_state['status'] == 'DONE' else None
                 ))
-        except Exception as e:
-            logger.error(f"Critical error processing {fname}: {e}")
+        except Exception:
+            logger.exception("[%s] Critical error processing file", fname)
             failed += 1
 
     logger.info(

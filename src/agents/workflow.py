@@ -79,8 +79,15 @@ class MigrationWorkflow:
             transpiled = sqlglot.transpile(
                 state["source_sql"], read=self.source_dialect, write=self.target_dialect
             )[0]
+            logger.debug(
+                "[%s] Transpile success (source len=%d, target len=%d)",
+                state['file_path'],
+                len(state["source_sql"] or ""),
+                len(transpiled or ""),
+            )
             return {"target_sql": transpiled, "status": "PENDING"}
         except Exception as e:
+            logger.exception("[%s] Transpile failed", state['file_path'])
             return {
                 "target_sql": state["source_sql"],
                 "error_msg": str(e),
@@ -95,6 +102,7 @@ class MigrationWorkflow:
             HumanMessage(content=f"SQL: {state['target_sql']}"),
         ]
         response = self.llm.invoke(messages).content.strip()
+        logger.debug("[%s] Reviewer response: %s", state['file_path'], response)
 
         if "PASS" in response.upper():
             return {"status": "REVIEW_PASS"}
@@ -124,6 +132,12 @@ class MigrationWorkflow:
 
         response = self.llm.invoke([HumanMessage(content=prompt)]).content
         cleaned_sql = response.replace("```sql", "").replace("```", "").strip()
+        logger.debug(
+            "[%s] Converter produced len=%d (retry=%d)",
+            state['file_path'],
+            len(cleaned_sql or ""),
+            state["retry_count"] + 1,
+        )
 
         return {
             "target_sql": cleaned_sql,
