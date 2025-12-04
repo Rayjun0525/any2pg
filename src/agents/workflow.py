@@ -1,6 +1,7 @@
 # src/agents/workflow.py
 
 import logging
+import re
 from typing import Optional, TypedDict
 
 import sqlglot
@@ -49,6 +50,7 @@ class MigrationWorkflow:
         workflow.add_node("reviewer", self.reviewer_node)
         workflow.add_node("verifier", self.verifier_node)
         workflow.add_node("converter", self.converter_node)
+        workflow.add_node("fail", self.fail_node)
 
         workflow.set_entry_point("transpiler")
         workflow.add_edge("transpiler", "reviewer")
@@ -68,7 +70,7 @@ class MigrationWorkflow:
         workflow.add_conditional_edges(
             "converter",
             self.check_retry,
-            {"retry": "reviewer", "abort": END},
+            {"retry": "reviewer", "abort": "fail"},
         )
 
         return workflow.compile()
@@ -104,7 +106,8 @@ class MigrationWorkflow:
         response = self.llm.invoke(messages).content.strip()
         logger.debug("[%s] Reviewer response: %s", state['file_path'], response)
 
-        if "PASS" in response.upper():
+        first_line = response.splitlines()[0].strip().upper() if response else ""
+        if first_line.startswith("PASS"):
             return {"status": "REVIEW_PASS"}
         return {"status": "REVIEW_FAIL", "error_msg": response}
 
@@ -131,19 +134,43 @@ class MigrationWorkflow:
         )
 
         response = self.llm.invoke([HumanMessage(content=prompt)]).content
-        cleaned_sql = response.replace("```sql", "").replace("```", "").strip()
+        cleaned_sql = self._extract_sql(response)
+
+        normalized_sql = cleaned_sql
+        try:
+            parsed = sqlglot.parse(cleaned_sql, read=self.target_dialect)
+            if parsed:
+                normalized_sql = ";\n".join(
+                    stmt.sql(dialect=self.target_dialect) for stmt in parsed
+                )
+        except Exception as parse_err:
+            logger.warning(
+                "[%s] Converter output could not be parsed: %s",
+                state["file_path"],
+                parse_err,
+            )
         logger.debug(
             "[%s] Converter produced len=%d (retry=%d)",
             state['file_path'],
-            len(cleaned_sql or ""),
+            len(normalized_sql or ""),
             state["retry_count"] + 1,
         )
 
         return {
-            "target_sql": cleaned_sql,
+            "target_sql": normalized_sql,
             "retry_count": state["retry_count"] + 1,
             "rag_context": context,
         }
+
+    @staticmethod
+    def _extract_sql(response: str) -> str:
+        if not response:
+            return ""
+
+        match = re.search(r"```(?:sql)?\s*(.*?)```", response, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return response.replace("```sql", "").replace("```", "").strip()
 
     def check_review(self, state: AgentState):
         if state["status"] == "REVIEW_PASS":
@@ -160,3 +187,14 @@ class MigrationWorkflow:
             return "retry"
         logger.error(f"[{state['file_path']}] Max retries exceeded.")
         return "abort"
+
+    def fail_node(self, state: AgentState):
+        max_retry_msg = (
+            f"Reached max retries ({self.max_retries}) without passing verification."
+        )
+        error_msg = state.get("error_msg") or max_retry_msg
+        if error_msg and max_retry_msg not in error_msg:
+            error_msg = f"{error_msg} | {max_retry_msg}"
+
+        logger.error("[%s] Marking migration as FAILED: %s", state["file_path"], error_msg)
+        return {"status": "FAILED", "error_msg": error_msg}

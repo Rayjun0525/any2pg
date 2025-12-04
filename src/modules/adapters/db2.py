@@ -34,20 +34,19 @@ class DB2Adapter(BaseDBAdapter):
         sql = """
         SELECT ROUTINENAME, ROUTINETYPE, TEXT
         FROM SYSCAT.ROUTINES
-        WHERE OWNERSCHEM = :schema
-          AND ROUTINETYPE IN ('P', 'F')
+        WHERE ROUTINETYPE IN ('P', 'F')
+        {schema_filter}
         """
 
-        if not target_schema:
-            sql = sql.replace(":schema", "CURRENT SCHEMA")
-            params = {}
-        else:
-            params = {"schema": target_schema}
+        schema_filter = "AND ROUTINESCHEMA = :schema" if target_schema else "AND ROUTINESCHEMA = CURRENT SCHEMA"
+        params = {"schema": target_schema} if target_schema else {}
+
+        query = sql.format(schema_filter=schema_filter)
 
         results = []
         try:
             with self.engine.connect() as conn:
-                rows = conn.execute(text(sql), params)
+                rows = conn.execute(text(query), params)
                 for row in rows:
                     r_name = row[0]
                     r_type_code = row[1]

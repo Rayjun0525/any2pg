@@ -51,6 +51,10 @@ def configure_logging(config: dict):
     handlers = [logging.StreamHandler(sys.stdout)]
     log_file = logging_conf.get("file")
     if log_file:
+        log_file = os.path.expanduser(os.path.expandvars(log_file))
+        log_dir = os.path.dirname(os.path.abspath(log_file))
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
         handlers.append(
             RotatingFileHandler(
                 log_file,
@@ -71,6 +75,27 @@ def configure_logging(config: dict):
         level_name,
         log_file or "stdout",
     )
+
+
+def apply_logging_overrides(config: dict, args: argparse.Namespace) -> None:
+    """Merge logging-level/file overrides from CLI args or environment into config."""
+
+    config.setdefault("logging", {})
+    logging_conf = config["logging"]
+
+    env_level = os.getenv("ANY2PG_LOG_LEVEL")
+    env_file = os.getenv("ANY2PG_LOG_FILE")
+
+    if args.log_level:
+        logging_conf["level"] = args.log_level
+    elif env_level:
+        logging_conf["level"] = env_level
+
+    # Preserve intentional empty string (disable file) by checking for None explicitly
+    if args.log_file is not None:
+        logging_conf["file"] = args.log_file
+    elif env_file is not None:
+        logging_conf["file"] = env_file
 
 def run_init(config):
     """Initialize SQLite storage and extract source metadata."""
@@ -252,9 +277,22 @@ def main():
         default=None,
         help="Override project.db_file from config (useful per run without editing YAML)",
     )
+    parser.add_argument(
+        '--log-level',
+        type=str,
+        default=None,
+        help="Override logging.level from config (DEBUG/INFO/WARNING/ERROR)",
+    )
+    parser.add_argument(
+        '--log-file',
+        type=str,
+        default=None,
+        help="Override logging.file path from config (empty string disables file handler)",
+    )
 
     args = parser.parse_args()
     config = load_config(args.config)
+    apply_logging_overrides(config, args)
     configure_logging(config)
 
     # Allow CLI override of SQLite path without editing YAML
