@@ -1,0 +1,37 @@
+project:
+  source_dir: "./sample/queries"        # Sample SQL inputs packaged with the repo
+  target_dir: "./output"                # Converted outputs will be written here
+  db_file: "./sample/migration.sample.db" # SQLite metadata cache for this sample run
+  max_retries: 3                         # Stop self-correction after three attempts per file
+
+logging:
+  level: "DEBUG"                        # DEBUG to observe every stage in the sample
+  module_levels:                        # Fine-grained overrides for noisy modules
+    modules.postgres_verifier: "INFO"
+  file: "./sample/any2pg.sample.log"    # File logger with rotation
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  max_bytes: 524288                      # Rotate after ~512KB
+  backup_count: 2                       # Keep two rotated archives
+
+database:
+  source:
+    type: "oracle"                      # Uses the bundled Oracle adapter
+    uri: "oracle+oracledb://username:password@localhost:1521/?service_name=xe"
+    schemas: ["HR", "SCOTT"]             # Multiple schemas extracted in one pass
+  target:
+    type: "postgres"                    # Verification happens against PostgreSQL
+    uri: "postgresql://username:password@localhost:5432/postgres"
+    statement_timeout_ms: 8000           # Abort verification queries taking longer than 8s
+
+llm:
+  provider: "ollama"                    # Aligns with the default quickstart
+  model: "gemma:7b"
+  base_url: "http://localhost:11434"
+  temperature: 0.2
+
+rules:
+  - "Prefer COALESCE over NVL when targeting PostgreSQL."
+  - "Use PostgreSQL INTERVAL syntax for date arithmetic."
+  - "Replace DECODE with CASE expressions."
+  - "Map SYSDATE to CURRENT_TIMESTAMP."
+
