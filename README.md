@@ -113,3 +113,7 @@ rules:                                # Free-form guidance strings for the revie
 - Primary code lives under `src/modules/` (metadata_extractor, context_builder, postgres_verifier, adapters). LangGraph workflow and prompts sit under `src/agents/`.
 - Backward compatibility shims: `src/context_builder_shim.py` and `src/postgres_verifier_shim.py` re-export their implementations—new code should import from `src/modules/` paths directly.
 - All comments/docstrings are in English for consistency; user-facing CLI messages remain bilingual where helpful.
+
+## 11) Live Database Verification (PostgreSQL / Oracle)
+- PostgreSQL smoke tests: set `POSTGRES_TEST_DSN` (e.g., `postgresql://user:pass@localhost:5432/any2pg_test`) and run `python -m pytest -q` to execute the `tests/integration/test_postgres_live.py` suite. The verifier runs inside a transaction and rolls back every statement.
+- Oracle smoke tests: an Oracle instance is required but not bundled; set `ORACLE_TEST_DSN` and add analogous fixtures before enabling end-to-end Oracle checks.
