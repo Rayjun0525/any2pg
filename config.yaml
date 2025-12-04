@@ -1,0 +1,38 @@
+project:
+  source_dir: "./input"               # Directory containing source SQL files
+  target_dir: "./output"              # Converted SQL output directory
+  db_file: "./migration.db"           # Default SQLite path (override with --db-file)
+  max_retries: 5                       # Converter loop limit before aborting
+
+logging:
+  level: "INFO"                        # DEBUG for deep tracing, INFO for normal runs
+  module_levels:                     # Optional per-module overrides for targeted tracing
+    modules.context_builder: "DEBUG"
+    agents.workflow: "DEBUG"
+  file: "./any2pg.log"                # Empty string to disable file output
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  max_bytes: 1048576                    # Rotate after ~1MB
+  backup_count: 3                       # Number of rotated files to keep
+
+database:
+  source:
+    type: "oracle"                      # See adapter table in README for options
+    uri: "oracle+oracledb://username:password@localhost:1521/?service_name=xe"
+    schemas: ["HR", "SCOTT", "SALES"]   # Leave empty to use the connection's default schema
+
+  target:
+    type: "postgres"
+    uri: "postgresql://username:password@localhost:5432/postgres"
+    statement_timeout_ms: 5000          # Optional statement_timeout during verification (ms)
+
+llm:
+  provider: "ollama"                    # Provider handled by LangChain
+  model: "gemma:7b"                     # Model name exposed by the provider
+  base_url: "http://localhost:11434"
+  temperature: 0.1
+
+rules:
+  - "Convert Oracle NVL to COALESCE in PostgreSQL."
+  - "Use PostgreSQL INTERVAL syntax for date arithmetic."
+  - "Rewrite DECODE into standard CASE expressions."
+  - "Map SYSDATE to CURRENT_TIMESTAMP."
