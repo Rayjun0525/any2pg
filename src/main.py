@@ -3,6 +3,7 @@ import sys
 import yaml
 import argparse
 import logging
+from logging.handlers import RotatingFileHandler
 from tqdm import tqdm
 
 from modules.db_manager import DBManager
@@ -11,22 +12,47 @@ from modules.rag_engine import RAGContextBuilder
 from modules.verifier import VerifierAgent
 from agents.workflow import MigrationWorkflow
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
 logger = logging.getLogger("Any2PG")
+logger.addHandler(logging.NullHandler())
 
 def load_config(path="config.yaml"):
     if not os.path.exists(path):
-        logger.error(f"Config file not found: {path}")
+        print(f"Config file not found: {path}", file=sys.stderr)
         sys.exit(1)
     with open(path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
+
+def configure_logging(config: dict):
+    logging_conf = config.get("logging", {})
+
+    level_name = logging_conf.get("level", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    fmt = logging_conf.get(
+        "format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    handlers = [logging.StreamHandler(sys.stdout)]
+    log_file = logging_conf.get("file")
+    if log_file:
+        handlers.append(
+            RotatingFileHandler(
+                log_file,
+                maxBytes=logging_conf.get("max_bytes", 1_000_000),
+                backupCount=logging_conf.get("backup_count", 3),
+                encoding="utf-8",
+            )
+        )
+
+    logging.basicConfig(level=level, format=fmt, handlers=handlers, force=True)
+    logger.info(
+        "Logging configured (level=%s, output=%s)",
+        level_name,
+        log_file or "stdout",
+    )
+
 def run_init(config):
-    """시스템 초기화 및 메타데이터 추출"""
+    """Initialize SQLite storage and extract source metadata."""
     db_path = config['project']['db_file']
     logger.info(f"Initializing System with DB: {db_path}")
     
@@ -37,7 +63,7 @@ def run_init(config):
     extractor.run()
 
 def run_reset_logs(config):
-    """작업 로그 초기화"""
+    """Clear migration log table for a clean retry."""
     db_path = config['project']['db_file']
     logger.info(f"Resetting logs for DB: {db_path}")
     db = DBManager(db_path)
@@ -46,7 +72,7 @@ def run_reset_logs(config):
     logger.info("Logs reset complete.")
 
 def run_migration(config):
-    """마이그레이션 메인 루프"""
+    """Execute the migration workflow for pending SQL files."""
     source_dir = config['project']['source_dir']
     target_dir = config['project']['target_dir']
     db_path = config['project']['db_file']
@@ -55,7 +81,8 @@ def run_migration(config):
         os.makedirs(target_dir)
 
     db = DBManager(db_path)
-    rag = RAGContextBuilder(db)
+    source_dialect = config['database']['source'].get('type', 'oracle')
+    rag = RAGContextBuilder(db, source_dialect=source_dialect)
     verifier = VerifierAgent(config)
     workflow_engine = MigrationWorkflow(config, rag, verifier)
     
@@ -77,6 +104,7 @@ def run_migration(config):
 
     logger.info(f"Processing {len(pending_files)} / {len(all_files)} files using DB: {db_path}")
     
+    done, failed = 0, 0
     for fname in tqdm(pending_files, desc="Processing Files"):
         file_path = os.path.join(source_dir, fname)
         output_path = os.path.join(target_dir, fname)
@@ -100,7 +128,14 @@ def run_migration(config):
             if final_state['status'] == 'DONE' and final_state['target_sql']:
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(final_state['target_sql'])
-            
+                done += 1
+                logger.info(f"[{fname}] migration complete → {output_path}")
+            else:
+                failed += 1
+                logger.warning(
+                    f"[{fname}] status={final_state['status']} error={final_state['error_msg']}"
+                )
+
             with db.get_cursor(commit=True) as cur:
                 cur.execute("""
                     INSERT INTO migration_logs (file_path, status, retry_count, last_error_msg, target_path)
@@ -120,19 +155,57 @@ def run_migration(config):
                 ))
         except Exception as e:
             logger.error(f"Critical error processing {fname}: {e}")
+            failed += 1
+
+    logger.info(
+        f"Run summary: {done} succeeded, {failed} failed/incomplete out of {len(pending_files)} pending files"
+    )
 
 def main():
-    parser = argparse.ArgumentParser(description="Any2PG: Hybrid SQL Migration Tool")
-    parser.add_argument('--init', action='store_true', help="Initialize DB and Extract Metadata")
-    parser.add_argument('--run', action='store_true', help="Run Migration Workflow")
-    parser.add_argument('--reset-logs', action='store_true', help="Reset Migration Logs")
-    # [변경] 프로젝트별 DB 파일 지정 옵션 추가
-    parser.add_argument('--db-file', type=str, default=None, help="Path to SQLite DB file (Overrides config)")
-    
-    args = parser.parse_args()
-    config = load_config()
+    parser = argparse.ArgumentParser(
+        description="Any2PG: Hybrid SQL Migration Tool",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python src/main.py --init --config config.yaml\n"
+            "  python src/main.py --run --db-file project_A.db\n"
+            "  python src/main.py --reset-logs --db-file project_A.db\n"
+            "All behavior is controlled via the YAML config; CLI flags only select the operation and override the DB file."
+        ),
+    )
+    parser.add_argument(
+        '--init',
+        action='store_true',
+        help="Initialize SQLite storage and extract source DB metadata",
+    )
+    parser.add_argument(
+        '--run',
+        action='store_true',
+        help="Run the migration workflow for SQL files in project.source_dir",
+    )
+    parser.add_argument(
+        '--reset-logs',
+        action='store_true',
+        help="Truncate migration_logs to retry all input files",
+    )
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='config.yaml',
+        help="Path to YAML config controlling adapters, logging, RAG, verifier, and directories",
+    )
+    parser.add_argument(
+        '--db-file',
+        type=str,
+        default=None,
+        help="Override project.db_file from config (useful per run without editing YAML)",
+    )
 
-    # CLI 인자가 있으면 config 덮어쓰기
+    args = parser.parse_args()
+    config = load_config(args.config)
+    configure_logging(config)
+
+    # Allow CLI override of SQLite path without editing YAML
     if args.db_file:
         config['project']['db_file'] = args.db_file
 
@@ -144,6 +217,7 @@ def main():
         run_migration(config)
     else:
         parser.print_help()
+
 
 if __name__ == "__main__":
     main()
