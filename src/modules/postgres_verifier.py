@@ -138,6 +138,14 @@ class VerifierAgent:
         if self.statement_timeout_ms:
             conn_args["options"] = f"-c statement_timeout={self.statement_timeout_ms}"
 
+        logger.info(
+            "Applying SQL to target (uri=%s, timeout_ms=%s, statements=%d, skipped=%d)",
+            self._redact_dsn(self.target_dsn),
+            self.statement_timeout_ms,
+            len(executable),
+            len(skipped),
+        )
+
         try:
             with psycopg.connect(self.target_dsn, **conn_args) as conn:
                 with conn.cursor() as cur:
@@ -160,9 +168,13 @@ class VerifierAgent:
                         conn.rollback()
                         diag = getattr(db_err, "diag", None)
                         primary = getattr(diag, "message_primary", None) if diag else None
+                        context = getattr(diag, "context", None) if diag else None
                         error_msg = primary or str(db_err) or "Unknown database error"
+                        if context:
+                            error_msg += f" | Context: {context}"
                         if failing_stmt:
                             error_msg += f" | SQL: {failing_stmt}"
+                        logger.warning("Target apply failed: %s", error_msg)
                         return VerificationResult(
                             False,
                             error_msg,
