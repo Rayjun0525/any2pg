@@ -56,13 +56,13 @@ python src/main.py --mode report --config config.yaml --schema-filter HR
 ## 6) Interactive TUI workflow (default launch)
 1. **Start the app**: `python src/main.py --config config.yaml` shows the banner with the configured `project.name`/`project.version`.
 2. **Collect metadata**: choose *Collect metadata* to connect to `database.source` and persist schemas + DDL into SQLite (`schema_objects`).
-3. **Browse metadata**: the *Browse metadata* submenu drills into schemas → objects → DDL/source so you can review what was imported.
-4. **Run/Resume porting**: pick *Run/Resume porting*, then choose **FAST** (sqlglot + verifier) or **FULL** (LLM+RAG) mode and optionally filter by selected/changed assets or explicit file names.
+3. **Status & browse**: the *Status & browse* area groups **Metadata overview** (schemas → objects → DDL/source), **Porting status** (counts + latest rendered outputs), and **Execution logs** (especially useful with `project.silent_mode`/`--silent`).
+4. **Run/Resume porting**: pick *Run/Resume porting*, then choose **FAST** (sqlglot + verifier) or **FULL** (LLM+RAG) mode. Advanced filters are optional; the default run uses the YAML config as-is and simply streams progress.
 5. **Pause/Resume**: if processing stops mid-way, rerun the same menu; only assets not marked `DONE` (or whose hashes changed) will resume.
 6. **Export/Apply**: use *Export rendered SQL* to write outputs to disk or *Apply rendered SQL* to push them to the target DB.
-7. **Check progress**: *Progress & logs* summarizes migration statuses and shows structured entries from `execution_logs` (especially when `project.silent_mode`/`--silent` is enabled).
-8. **Quality checks**: run built-in quality gates directly from the menu.
-9. **Silent mode**: enable `project.silent_mode: true` or pass `--silent` to write execution events to SQLite while keeping stdout quiet.
+7. **Quality checks**: run built-in quality gates directly from the menu.
+8. **Silent mode**: enable `project.silent_mode: true` or pass `--silent` to write execution events to SQLite while keeping stdout quiet.
+9. **Navigation**: move with ↑/↓, go back with ←, and select with → or Enter (ESC also closes a menu).
 
 ## 7) Configuration Reference (config.yaml)
 ```yaml
