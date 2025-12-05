@@ -65,10 +65,16 @@ def _make_sandbox_config(config: dict) -> tuple[dict, str]:
     sandbox_dir = tempfile.mkdtemp(prefix="any2pg_quality_")
     cloned = deepcopy(config)
     cloned.setdefault("project", {})
-    cloned["project"]["db_file"] = os.path.join(sandbox_dir, "quality.sqlite")
-    cloned["project"]["source_dir"] = sandbox_dir
-    cloned["project"]["target_dir"] = os.path.join(sandbox_dir, "output")
-    os.makedirs(cloned["project"]["target_dir"], exist_ok=True)
+    cloned_project = cloned["project"]
+    cloned_project["db_file"] = os.path.join(sandbox_dir, "quality.sqlite")
+    cloned_project.setdefault("mirror_outputs", False)
+    cloned_project.setdefault("auto_ingest_source_dir", False)
+
+    cloned_project.setdefault("source_dir", os.path.join(sandbox_dir, "input"))
+    os.makedirs(cloned_project["source_dir"], exist_ok=True)
+
+    cloned_project.setdefault("target_dir", os.path.join(sandbox_dir, "output"))
+    os.makedirs(cloned_project["target_dir"], exist_ok=True)
     return cloned, sandbox_dir
 
 
@@ -84,13 +90,30 @@ def _check_config(config: dict) -> QualityMetric:
         )
 
     project = config.get("project", {})
-    missing_project = [key for key in ("name", "source_dir", "target_dir", "db_file", "max_retries") if key not in project]
+    required_project = ("name", "db_file", "max_retries")
+    missing_project = [key for key in required_project if key not in project]
     if missing_project:
         return QualityMetric(
             name="Configuration completeness",
             score=5,
             details=f"Missing project fields: {', '.join(sorted(missing_project))}",
             recommendation="Fill in required project fields before running quality checks",
+        )
+
+    if project.get("mirror_outputs") and not project.get("target_dir"):
+        return QualityMetric(
+            name="Configuration completeness",
+            score=7,
+            details="mirror_outputs is true but project.target_dir is not set",
+            recommendation="Set project.target_dir when enabling mirror_outputs or disable mirroring",
+        )
+
+    if project.get("auto_ingest_source_dir") and not project.get("source_dir"):
+        return QualityMetric(
+            name="Configuration completeness",
+            score=7,
+            details="auto_ingest_source_dir is true but project.source_dir is not set",
+            recommendation="Provide a source_dir when auto_ingest_source_dir is enabled or disable auto-ingest",
         )
 
     max_retries = project.get("max_retries", 0)
