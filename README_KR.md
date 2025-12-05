@@ -1,0 +1,139 @@
+# Any2PG (한글 안내)
+
+이 도구는 다양한 원천 SQL(Oracle/MySQL 등)을 PostgreSQL로 변환하고, LLM 기반 리뷰·수정과 PostgreSQL 검증을 거쳐 안전한 결과를 생성하는 하이브리드 마이그레이션 툴입니다. 이 문서를 순서대로 따라 하면 별도 참조 없이 설치·구성·운영을 진행할 수 있습니다.
+
+## 1) Any2PG가 하는 일
+- 다단계 파이프라인: SQLGlot 변환 ➜ LLM 리뷰/패치 ➜ PostgreSQL 검증(강제 `ROLLBACK`).
+- 재실행 친화적 처리: SQLite가 파일 상태를 기록해 완료된 항목을 건너뜀.
+- 메타데이터 기반 RAG: 스키마별 객체를 SQLite에 캐시해 정확한 컨텍스트를 제공.
+- 설정 우선 제어: 로깅, 어댑터, 검증 옵션, LLM 설정 모두 YAML로 관리.
+
+## 2) 아키텍처 한눈에 보기
+- **CLI (src/main.py):** `--init`, `--run`, `--reset-logs`와 `--config`, `--db-file`, `--log-level`, `--log-file` 오버라이드.
+- **추출기 (src/modules/metadata_extractor.py):** 설정된 스키마를 순회해 결과를 SQLite(`schema_objects`, `migration_logs`)에 저장.
+- **RAG 컨텍스트 빌더 (src/modules/context_builder.py):** SQLGlot으로 SQL을 파싱하고 SQLite에서 관련 객체를 조회.
+- **워크플로우 (src/agents/workflow.py):** LangGraph 상태 머신으로 변환 ➜ 리뷰 ➜ 검증 ➜ 보정 루프 수행.
+- **검증기 (src/modules/postgres_verifier.py):** PostgreSQL을 `autocommit=False`로 실행 후 무조건 롤백; 과거 호환용 쉼은 `src/context_builder_shim.py`, `src/postgres_verifier_shim.py`.
+
+## 3) 지원 소스 어댑터
+| Source DB | Config `database.source.type` | Adapter Path | 테이블/뷰 추출 | 프로시저 추출 |
+|-----------|------------------------------|--------------|---------------|---------------|
+| Oracle | `oracle` | `src/modules/adapters/oracle.py` | ✅ SQLAlchemy inspector | ✅ `USER_SOURCE` 집계 |
+| MySQL/MariaDB | `mysql` / `mariadb` | `src/modules/adapters/mysql.py` | ✅ inspector | ✅ `information_schema.ROUTINES` |
+| Microsoft SQL Server | `mssql` | `src/modules/adapters/mssql.py` | ✅(`dbo` 기본) | ✅ `sys.objects`/`sys.sql_modules` |
+| IBM DB2 | `db2` | `src/modules/adapters/db2.py` | ✅(대문자 스키마) | ✅ `SYSCAT.ROUTINES` |
+| SAP HANA | `hana` | `src/modules/adapters/hana.py` | ✅ inspector | ✅ `SYS.PROCEDURES` |
+| Snowflake | `snowflake` | `src/modules/adapters/snowflake.py` | ✅ inspector | ✅ `information_schema.routines` |
+| MongoDB | `mongodb` | `src/modules/adapters/mongodb.py` | ✅ 컬렉션을 테이블로 취급 | 🚫 (미지원) |
+
+> 새로운 어댑터가 없으면 `ValueError`가 발생합니다. `BaseDBAdapter`를 상속해 `src/modules/adapters/`에 구현을 추가하세요.
+
+## 4) 전체 실행 흐름
+1. **메타데이터 모드 (`--mode metadata` 또는 `--init`)**: 소스 DB에 연결해 설정된 스키마를 추출하고 SQLite에 캐시합니다. 추출은 읽기 전용이며 원천 DB를 변경하지 않습니다.
+2. **포팅 모드 (`--mode port` 또는 `--run`, 기본)**: `project.source_dir`의 SQL 파일을 읽어 변환/리뷰/검증을 수행하고 결과를 `project.target_dir`에 기록합니다. 검증은 BEGIN/ROLLBACK 트랜잭션으로 감싸며, 위험 DDL/DML이나 프로시저 호출은 `verification.*` 설정을 허용하기 전까지 건너뜁니다. 진행 상황은 `migration_logs`에 `PENDING/DONE/FAILED/...` 상태로 저장됩니다.
+3. **리포트 모드 (`--mode report`)**: SQLite에 축적된 변환 결과를 `project.name` 단위로 조회하고, 스키마/상태 필터로 보고서를 좁힐 수 있습니다. 스킵된 문장과 재시도 횟수도 함께 표시됩니다.
+4. **로그 리셋 (`--reset-logs`)**: 현재 `project.name`에 해당하는 `migration_logs`를 초기화해 모든 파일을 다시 처리합니다.
+5. **회복력**: 재실행 시 `DONE` 상태는 건너뛰며, 재시도는 `project.max_retries`에 도달하면 중단됩니다.
+
+## 5) 빠른 시작
+```bash
+# 0) 의존성 설치
+python -m pip install -r requirements.txt
+
+# 1) 옵션 확인
+python src/main.py --help
+
+# 2) 샘플 설정 복사 후 연결 URI/스키마 수정
+cp sample/config.sample.yaml ./config.yaml
+
+# 3) 메타데이터 DB 초기화 (필요 시 경로 오버라이드)
+python src/main.py --init --config config.yaml --db-file "./project_A.db" --log-level DEBUG --log-file "./logs/any2pg.log"
+
+# 4) 변환 실행 (중단 후 재개 가능)
+python src/main.py --run --config config.yaml --db-file "./project_A.db"
+
+# 5) 전체 재실행을 위해 상태 초기화
+python src/main.py --reset-logs --config config.yaml --db-file "./project_A.db"
+
+# 6) 재실행 없이 결과만 확인
+python src/main.py --mode report --config config.yaml --schema-filter HR
+```
+
+## 6) 설정 참조 (config.yaml)
+```yaml
+project:
+  name: "example_project"        # 모든 SQLite 행과 리포트를 이 프로젝트명으로 구분
+  source_dir: "./input"            # 원본 SQL 파일 위치
+  target_dir: "./output"           # 변환 SQL 출력 위치
+  db_file: "./migration.db"        # 기본 SQLite 경로 (--db-file로 오버라이드 가능)
+  max_retries: 5                    # 보정 루프 최대 재시도 횟수
+
+logging:
+  level: "INFO"                     # DEBUG, INFO, WARNING, ERROR
+  module_levels:                    # 모듈별 상세 로깅이 필요할 때 사용
+    agents.workflow: "DEBUG"
+    modules.context_builder: "DEBUG"
+  file: "./any2pg.log"             # 빈 문자열이면 콘솔만 사용
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  max_bytes: 1048576                # 약 1MB마다 로테이션
+  backup_count: 3                   # 보관할 로테이션 파일 수
+
+database:
+  source:
+    type: "oracle"                 # 위 어댑터 표 참고
+    uri: "oracle+oracledb://user:pass@host:1521/?service_name=xe"
+    schemas: ["HR", "SCOTT"]       # 스키마 목록; 생략 시 DB 기본값
+  target:
+    type: "postgres"
+    uri: "postgresql://user:pass@localhost:5432/postgres"
+    statement_timeout_ms: 5000      # 검증 시 사용할 PG statement_timeout
+
+llm:
+  provider: "ollama"               # LangChain이 인터페이스 처리
+  model: "gemma:7b"
+  base_url: "http://localhost:11434"
+  temperature: 0.1
+
+verification:
+  mode: "port"                    # metadata | port | report (기본값은 포팅)
+  allow_dangerous_statements: false  # true면 DDL/DML 실행 허용(여전히 BEGIN/ROLLBACK 적용)
+  allow_procedure_execution: false   # true면 CALL/DO/EXECUTE 검증 실행 허용
+
+rules:                                # 리뷰어에게 전달할 가이드 문자열
+  - "Convert Oracle NVL to COALESCE."
+  - "Replace SYSDATE with CURRENT_TIMESTAMP."
+```
+
+## 7) SQLite 스키마
+- **schema_objects**: `obj_id`(PK), `project_name`, `schema_name`, `obj_name`, `obj_type`, `ddl_script`, `source_code`, `extracted_at`. `(project_name, schema_name, obj_name, obj_type)`로 유니크 보장.
+- **migration_logs / 리포트 소스**: `project_name`, `file_path`, `detected_schemas`, `status`, `retry_count`, `last_error_msg`, `target_path`, `skipped_statements`, `executed_statements`, `updated_at`. `(project_name, file_path)` 유니크로 동일 SQLite 파일을 여러 프로젝트가 안전하게 공유.
+  - `detected_schemas`는 파싱된 SQL 참조로부터 파생되어, 스키마 기반 필터를 적용해도 프로젝트 간 충돌이 없습니다.
+
+## 8) 샘플 자산
+- `sample/config.sample.yaml`: Oracle➜Postgres 기본값이 포함된 복사용 샘플.
+- `sample/queries/*.sql`: 세 개의 예제 쿼리(단순 select, join+decode, 함수 호출)로 워크플로를 검증할 수 있습니다. `./input`에 복사해 바로 실행해 보세요.
+
+## 9) 로깅 & 트러블슈팅
+- 조정: `logging.level`로 출력 수준을 조절하거나 `--log-level`(`ANY2PG_LOG_LEVEL`)로 1회성 오버라이드하세요. 파일 경로는 `--log-file`(`ANY2PG_LOG_FILE`) 또는 YAML로 지정하며, 필요 시 상위 디렉터리를 자동 생성합니다.
+- 타깃 추적: 특정 모듈만 자세히 보고 싶다면 `logging.module_levels`로 설정합니다(예: 단계별 트레이스를 위한 `agents.workflow`, 컨텍스트 조회 디버깅용 `modules.context_builder`).
+- 검증 안전장치: 검증은 명시적 `BEGIN`/`ROLLBACK`으로 감싸며, 위험 DDL/DML과 프로시저 실행은 `verification.allow_dangerous_statements`/`allow_procedure_execution`을 활성화하지 않는 한 건너뜁니다. Statement timeout도 설정 가능. **데이터 동등성 비교는 자동으로 수행되지 않으므로, 실제 데이터 검증은 사용자가 직접 진행해야 합니다.**
+- 어댑터 이슈: 다수의 어댑터는 SQLAlchemy inspector를 사용합니다. 필요한 드라이버가 없으면 import/connection 에러가 발생하므로 소스 DB에 맞는 드라이버를 설치하세요.
+- 재개 로직: `FAILED`/`VERIFY_FAIL` 상태가 남으면 `migration_logs.last_error_msg`를 확인하고 필요 시 `project.max_retries`를 늘리세요.
+- 설정 검증: 시작 시 필수 키(`project.*`, `database.{source,target}.uri`, `llm.*`)를 검사하고 `max_retries < 1`이면 실패하므로 잘못된 설정을 초기에 차단합니다.
+- 결정적 컨텍스트: RAG 컨텍스트 빌더는 `schema_name`, `obj_type`, `obj_name` 순으로 정렬된 결과를 반환해 실행마다 동일한 프롬프트를 제공합니다.
+- 리포팅: `--mode report --schema-filter HR`로 활성 `project.name` 범위의 SQLite 결과를 출력하며, 스킵된 문장·재시도 횟수를 포함해 교차 프로젝트 누출 없이 확인할 수 있습니다.
+
+## 10) 품질 게이트 & 테스트
+- 방어적 설정 검증(경로 확장, 재시도 수 정규화, 필수 키 확인)으로 잘못된 실행을 조기에 차단합니다.
+- SQLite 작업은 모두 트랜잭션 기반이며 오류 시 롤백해 부분 저장을 방지합니다.
+- RAG 컨텍스트 빌더는 파싱 실패 시 안전하게 무시하며, DDL/소스 텍스트를 제공하는 객체만 전달합니다.
+- 전체 테스트는 `python -m pytest`로 실행하며, 실 PostgreSQL 스모크 테스트를 위해 `POSTGRES_TEST_DSN`을 설정할 수 있습니다.
+
+## 11) 개발자 노트
+- 핵심 코드는 `src/modules/`(metadata_extractor, context_builder, postgres_verifier, adapters)에 있으며, LangGraph 워크플로와 프롬프트는 `src/agents/` 아래에 있습니다.
+- 하위 호환을 위해 `src/context_builder_shim.py`, `src/postgres_verifier_shim.py`가 동일 구현을 재노출합니다. 신규 코드는 `src/modules/` 경로를 직접 임포트하세요.
+- 주석/도큐스트링은 일관성을 위해 영어로 유지하지만, CLI 메시지는 필요한 곳에 한/영을 병기합니다.
+
+## 12) 실 DB 검증 (PostgreSQL / Oracle)
+- PostgreSQL 스모크 테스트: `POSTGRES_TEST_DSN`(예: `postgresql://user:pass@localhost:5432/any2pg_test`)을 지정하고 `python -m pytest -q`를 실행하면 `tests/integration/test_postgres_live.py`가 동작합니다. 검증은 트랜잭션 내부에서 수행되며 모든 문장이 롤백됩니다.
+- Oracle 스모크 테스트: 번들되지 않은 외부 Oracle 인스턴스가 필요합니다. `ORACLE_TEST_DSN`을 설정하고 유사한 픽스처를 추가해 엔드 투 엔드 검증을 확장하세요.
