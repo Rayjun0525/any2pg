@@ -4,7 +4,7 @@ import yaml
 import argparse
 import logging
 from logging.handlers import RotatingFileHandler
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 from tqdm import tqdm
 
@@ -12,6 +12,7 @@ from modules.sqlite_store import DBManager
 from modules.metadata_extractor import MetadataExtractor
 from modules.context_builder import ContextResult, RAGContextBuilder
 from modules.postgres_verifier import VerifierAgent
+from quality_check import render_quality_report, run_quality_checks
 from agents.workflow import MigrationWorkflow
 
 logger = logging.getLogger("Any2PG")
@@ -70,6 +71,9 @@ def validate_config(config: dict) -> dict:
     project["name"] = str(project["name"]).strip()
     if not project["name"]:
         raise ValueError("project.name must be a non-empty string")
+
+    project.setdefault("mirror_outputs", False)
+    project.setdefault("auto_ingest_source_dir", True)
 
     project["source_dir"] = expand_path(project["source_dir"])
     project["target_dir"] = expand_path(project["target_dir"])
@@ -151,6 +155,29 @@ def apply_logging_overrides(config: dict, args: argparse.Namespace) -> None:
     elif env_file is not None:
         logging_conf["file"] = env_file
 
+
+def _sync_source_dir(db: DBManager, source_dir: str, auto_select: bool = True) -> None:
+    """Ingest .sql files from source_dir into SQLite as source_assets."""
+
+    if not os.path.isdir(source_dir):
+        logger.warning("Source directory not found for sync: %s", source_dir)
+        return
+
+    sql_files = sorted([f for f in os.listdir(source_dir) if f.lower().endswith('.sql')])
+    if not sql_files:
+        logger.warning("No SQL files discovered in source_dir=%s", source_dir)
+        return
+
+    for fname in sql_files:
+        file_path = os.path.join(source_dir, fname)
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                sql_text = f.read()
+        except OSError as exc:
+            logger.error("Failed to read %s: %s", file_path, exc)
+            continue
+        db.sync_source_asset(file_path, sql_text, selected_for_port=auto_select)
+
 def run_init(config):
     """Initialize SQLite storage and extract source metadata."""
     db_path = config['project']['db_file']
@@ -165,7 +192,8 @@ def run_init(config):
 
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
-
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, config["project"]["source_dir"])
     extractor = MetadataExtractor(config, db)
     extractor.run()
 
@@ -186,13 +214,10 @@ def run_migration(config):
     db_path = config['project']['db_file']
     project_name = config['project']['name']
 
-    if not os.path.isdir(source_dir):
-        raise FileNotFoundError(f"Configured source_dir does not exist: {source_dir}")
-
-    if not os.path.exists(target_dir):
-        os.makedirs(target_dir)
-
     db = DBManager(db_path, project_name=project_name)
+    db.init_db()
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, source_dir)
     source_conf = config['database']['source']
     target_conf = config['database']['target']
     source_dialect = source_conf.get('type', 'oracle')
@@ -201,59 +226,55 @@ def run_migration(config):
     workflow_engine = MigrationWorkflow(config, rag, verifier)
 
     logger.info(
-        "Run starting (project=%s, source_dir=%s, target_dir=%s, db_file=%s, source=%s, target=%s)",
+        "Run starting (project=%s, source_dir=%s, target_dir=%s, db_file=%s, source=%s, target=%s, mirror_outputs=%s)",
         project_name,
         source_dir,
         target_dir,
         db_path,
         source_dialect,
         target_conf.get('type', 'postgres'),
+        config["project"].get("mirror_outputs", False),
     )
     
-    all_files = sorted([f for f in os.listdir(source_dir) if f.endswith('.sql')])
-    if not all_files:
-        logger.warning(f"No SQL files found in {source_dir}")
+    assets = db.list_source_assets(only_selected=True)
+    if not assets:
+        logger.warning(
+            "No SQL assets registered in SQLite; populate source_assets via --init, manual inserts, or enabling auto_ingest_source_dir (source_dir=%s)",
+            source_dir,
+        )
         return
 
-    # Resume logic
-    pending_files = []
-    with db.get_cursor() as cur:
-        for fname in all_files:
-            full_path = os.path.join(source_dir, fname)
-            cur.execute(
-                "SELECT status FROM migration_logs WHERE project_name = ? AND file_path = ?",
-                (project_name, full_path),
-            )
-            row = cur.fetchone()
-            if row and row['status'] == 'DONE':
-                continue
-            pending_files.append(fname)
+    pending_assets = []
+    for asset in assets:
+        status = asset["last_status"] or asset["log_status"]
+        if status == "DONE" and asset["source_hash"] == asset["content_hash"]:
+            continue
+        pending_assets.append(asset)
 
     logger.info(
-        "Processing %d / %d files using DB: %s",
-        len(pending_files),
-        len(all_files),
+        "Processing %d / %d assets using DB: %s",
+        len(pending_assets),
+        len(assets),
         db_path,
     )
-    logger.debug("Pending files: %s", ", ".join(pending_files))
+    logger.debug("Pending assets: %s", ", ".join(a["file_name"] for a in pending_assets))
 
-    if not pending_files:
-        logger.info("All files are already marked DONE; nothing to process.")
+    if not pending_assets:
+        logger.info("All assets are already marked DONE and unchanged; nothing to process.")
         return
     
     done, failed = 0, 0
-    for fname in tqdm(pending_files, desc="Processing Files"):
-        file_path = os.path.join(source_dir, fname)
-        output_path = os.path.join(target_dir, fname)
-
-        with open(file_path, 'r', encoding='utf-8') as f:
-            source_sql = f.read()
+    for asset in tqdm(pending_assets, desc="Processing Files"):
+        file_path = asset["file_path"]
+        file_name = asset["file_name"]
+        output_path = os.path.join(target_dir, file_name)
+        source_sql = asset["sql_text"]
 
         ctx_result: Optional[ContextResult] = None
         try:
             ctx_result = rag.build_context(source_sql)
         except Exception:
-            logger.warning("[%s] Failed to pre-compute context; continuing", fname)
+            logger.warning("[%s] Failed to pre-compute context; continuing", file_name)
             ctx_result = None
 
         initial_state = {
@@ -270,19 +291,31 @@ def run_migration(config):
         }
 
         try:
-            logger.info("[%s] Starting workflow", fname)
+            logger.info("[%s] Starting workflow", file_name)
             final_state = workflow_engine.app.invoke(initial_state)
 
             if final_state['status'] == 'DONE' and final_state['target_sql']:
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(final_state['target_sql'])
+                db.save_rendered_output(
+                    output_path,
+                    final_state['target_sql'],
+                    source_hash=asset["content_hash"],
+                    status=final_state['status'],
+                    verified=final_state.get('status') == 'DONE',
+                    last_error=final_state.get('error_msg'),
+                )
                 done += 1
-                logger.info("[%s] Migration complete -> %s", fname, output_path)
+                if config["project"].get("mirror_outputs", False):
+                    os.makedirs(target_dir, exist_ok=True)
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        f.write(final_state['target_sql'])
+                    logger.info("[%s] Migration complete -> %s", file_name, output_path)
+                else:
+                    logger.info("[%s] Migration complete (stored in SQLite)", file_name)
             else:
                 failed += 1
                 logger.warning(
                     "[%s] status=%s error=%s",
-                    fname,
+                    file_name,
                     final_state['status'],
                     final_state['error_msg'],
                 )
@@ -293,7 +326,8 @@ def run_migration(config):
             skipped_blob = "\n".join(skipped) if skipped else None
 
             with db.get_cursor(commit=True) as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO migration_logs (project_name, file_path, detected_schemas, status, retry_count, last_error_msg, target_path, skipped_statements, executed_statements)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_name, file_path) DO UPDATE SET
@@ -305,24 +339,39 @@ def run_migration(config):
                         skipped_statements = excluded.skipped_statements,
                         executed_statements = excluded.executed_statements,
                         updated_at = CURRENT_TIMESTAMP
-                """, (
-                    project_name,
-                    final_state['file_path'],
-                    schemas_text,
-                    final_state['status'],
-                    final_state['retry_count'],
-                    final_state['error_msg'],
-                    output_path if final_state['status'] == 'DONE' else None,
-                    skipped_blob,
-                    final_state.get('executed_statements', 0),
-                ))
+                """,
+                    (
+                        project_name,
+                        final_state['file_path'],
+                        schemas_text,
+                        final_state['status'],
+                        final_state['retry_count'],
+                        final_state['error_msg'],
+                        output_path if final_state['status'] == 'DONE' else None,
+                        skipped_blob,
+                        final_state.get('executed_statements', 0),
+                    ),
+                )
         except Exception:
-            logger.exception("[%s] Critical error processing file", fname)
+            logger.exception("[%s] Critical error processing file", file_name)
             failed += 1
 
     logger.info(
-        f"Run summary: {done} succeeded, {failed} failed/incomplete out of {len(pending_files)} pending files"
+        "Run summary: %s succeeded, %s failed/incomplete out of %s pending assets",
+        done,
+        failed,
+        len(pending_assets),
     )
+
+
+def run_quality_audit(config: dict) -> None:
+    """Run internal quality checks and print a scored report."""
+
+    logger.info("Running quality checks against a sandboxed SQLite store")
+    report = run_quality_checks(config)
+    print(render_quality_report(report))
+    if not report.perfect:
+        logger.warning("Quality checks finished with non-perfect scores")
 
 
 
@@ -382,6 +431,146 @@ def run_report(config, schema_filter: Optional[str] = None, status_filter: Optio
         print("-----------------------")
 
 
+def _list_assets(
+    config: dict,
+    show_sql: bool = False,
+    only_selected: bool = False,
+    only_changed: bool = False,
+    asset_names: Optional[Iterable[str]] = None,
+):
+    db_path = config['project']['db_file']
+    source_dir = config['project']['source_dir']
+    project_name = config['project']['name']
+    db = DBManager(db_path, project_name=project_name)
+    db.init_db()
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, source_dir)
+
+    assets = db.list_source_assets(only_selected=only_selected, only_changed=only_changed)
+    if asset_names:
+        names = {n for n in asset_names}
+        assets = [a for a in assets if a['file_name'] in names]
+
+    print(f"\n=== Registered assets in {db_path} (project={project_name}) ===")
+    if only_selected:
+        print("(only selected)")
+    if only_changed:
+        print("(only changed since last render)")
+    if not assets:
+        print("No assets found.")
+        return
+
+    for row in assets:
+        status = row['last_status'] or row['log_status'] or 'PENDING'
+        changed = 'CHANGED' if (row['source_hash'] != row['content_hash']) else 'OK'
+        print(f"- {row['file_name']} | status={status} | selected={bool(row['selected_for_port'])} | {changed}")
+        if row.get('parsed_schemas'):
+            print(f"  Schemas: {row['parsed_schemas']}")
+        if show_sql:
+            print("  --- SQL ---")
+            print(row['sql_text'])
+            print("  -----------")
+
+
+def _update_selection(config: dict, select: Iterable[str], deselect: Iterable[str]) -> None:
+    db_path = config['project']['db_file']
+    project_name = config['project']['name']
+    db = DBManager(db_path, project_name=project_name)
+    db.init_db()
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, config['project']['source_dir'])
+    selected = db.set_selection(select, True) if select else 0
+    deselected = db.set_selection(deselect, False) if deselect else 0
+    if select:
+        logger.info("Marked %d asset(s) as selected: %s", selected, ", ".join(select))
+    if deselect:
+        logger.info("Marked %d asset(s) as deselected: %s", deselected, ", ".join(deselect))
+
+
+def _export_outputs(
+    config: dict,
+    only_selected: bool = False,
+    changed_only: bool = False,
+    export_dir: Optional[str] = None,
+    asset_names: Optional[Iterable[str]] = None,
+):
+    project = config['project']
+    db = DBManager(project['db_file'], project_name=project['name'])
+    db.init_db()
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, project['source_dir'])
+
+    assets = db.list_source_assets(only_selected=only_selected, only_changed=changed_only)
+    allowed_names = {a['file_name'] for a in assets}
+    if asset_names:
+        filter_names = {n for n in asset_names}
+        allowed_names &= filter_names
+
+    export_dir = export_dir or project['target_dir']
+    os.makedirs(export_dir, exist_ok=True)
+
+    outputs = db.fetch_rendered_sql(allowed_names if allowed_names else None)
+    if not outputs:
+        logger.warning("No rendered outputs available for export.")
+        return
+
+    for row in outputs:
+        if changed_only and row['file_name'] not in allowed_names:
+            continue
+        if not row['sql_text']:
+            logger.warning("Skipping %s (no SQL stored)", row['file_name'])
+            continue
+        dest = os.path.join(export_dir, row['file_name'])
+        with open(dest, 'w', encoding='utf-8') as f:
+            f.write(row['sql_text'])
+        logger.info("Exported %s -> %s", row['file_name'], dest)
+
+
+def _apply_outputs(
+    config: dict,
+    only_selected: bool = False,
+    changed_only: bool = False,
+    asset_names: Optional[Iterable[str]] = None,
+):
+    project = config['project']
+    db = DBManager(project['db_file'], project_name=project['name'])
+    db.init_db()
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, project['source_dir'])
+    verifier = VerifierAgent(config)
+
+    assets = db.list_source_assets(only_selected=only_selected, only_changed=changed_only)
+    allowed_names = {a['file_name'] for a in assets}
+    if asset_names:
+        filter_names = {n for n in asset_names}
+        allowed_names &= filter_names
+
+    outputs = db.fetch_rendered_sql(allowed_names if allowed_names else None)
+    if not outputs:
+        logger.warning("No rendered outputs found to apply.")
+        return
+
+    for row in outputs:
+        if changed_only and row['file_name'] not in allowed_names:
+            continue
+        if not row['sql_text']:
+            logger.warning("Skipping %s (no SQL stored)", row['file_name'])
+            continue
+        result = verifier.apply_sql(row['sql_text'])
+        db.save_rendered_output(
+            row['file_path'],
+            row['sql_text'],
+            source_hash=row['source_hash'],
+            status='APPLIED' if result.success else 'FAILED',
+            verified=result.success,
+            last_error=result.error,
+        )
+        if result.success:
+            logger.info("Applied %s to PostgreSQL (skipped=%d)", row['file_name'], len(result.skipped_statements))
+        else:
+            logger.error("Failed applying %s: %s", row['file_name'], result.error)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Any2PG: Hybrid SQL Migration Tool",
@@ -396,7 +585,7 @@ def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['metadata', 'port', 'report'],
+        choices=['metadata', 'port', 'report', 'assets', 'export', 'apply', 'quality'],
         default=None,
         help="Select the operation mode (metadata extraction, porting, or report display)",
     )
@@ -451,6 +640,50 @@ def main():
         default=None,
         help="Filter report rows by status (report mode only)",
     )
+    parser.add_argument(
+        '--only-selected',
+        action='store_true',
+        help="Limit listing/export/apply to assets marked selected_for_port",
+    )
+    parser.add_argument(
+        '--show-sql',
+        action='store_true',
+        help="Print SQL bodies when listing assets",
+    )
+    parser.add_argument(
+        '--select',
+        nargs='*',
+        default=None,
+        help="Asset file names to mark as selected for porting",
+    )
+    parser.add_argument(
+        '--deselect',
+        nargs='*',
+        default=None,
+        help="Asset file names to unselect",
+    )
+    parser.add_argument(
+        '--export-dir',
+        type=str,
+        default=None,
+        help="Override directory for exporting rendered SQL (export mode)",
+    )
+    parser.add_argument(
+        '--changed-only',
+        action='store_true',
+        help="Only operate on assets whose source hash changed since last render",
+    )
+    parser.add_argument(
+        '--asset-names',
+        nargs='*',
+        default=None,
+        help="Restrict export/apply/list to specific asset file names",
+    )
+    parser.add_argument(
+        '--quality',
+        action='store_true',
+        help="Run internal quality checks (alias for --mode quality)",
+    )
 
     args = parser.parse_args()
     config = load_config(args.config)
@@ -467,15 +700,45 @@ def main():
         mode = "metadata"
     elif args.run:
         mode = "port"
+    elif args.quality:
+        mode = "quality"
 
     if args.reset_logs:
         run_reset_logs(config)
         return
 
+    if args.select or args.deselect:
+        _update_selection(config, args.select or [], args.deselect or [])
+
     if mode == "metadata":
         run_init(config)
     elif mode == "report":
         run_report(config, schema_filter=args.schema_filter, status_filter=args.status_filter)
+    elif mode == "assets":
+        _list_assets(
+            config,
+            show_sql=args.show_sql,
+            only_selected=args.only_selected,
+            only_changed=args.changed_only,
+            asset_names=args.asset_names,
+        )
+    elif mode == "export":
+        _export_outputs(
+            config,
+            only_selected=args.only_selected,
+            changed_only=args.changed_only,
+            export_dir=args.export_dir,
+            asset_names=args.asset_names,
+        )
+    elif mode == "apply":
+        _apply_outputs(
+            config,
+            only_selected=args.only_selected,
+            changed_only=args.changed_only,
+            asset_names=args.asset_names,
+        )
+    elif mode == "quality":
+        run_quality_audit(config)
     else:
         run_migration(config)
 

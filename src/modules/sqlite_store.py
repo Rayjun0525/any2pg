@@ -1,6 +1,9 @@
+import hashlib
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
+from typing import Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -84,6 +87,41 @@ class DBManager:
         );
         """
 
+        source_assets_ddl = """
+        CREATE TABLE IF NOT EXISTS source_assets (
+            asset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_name TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            sql_text TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            parsed_schemas TEXT,
+            selected_for_port INTEGER DEFAULT 1,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(project_name, file_path)
+        );
+        """
+
+        rendered_outputs_ddl = """
+        CREATE TABLE IF NOT EXISTS rendered_outputs (
+            output_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_name TEXT NOT NULL,
+            asset_id INTEGER,
+            file_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            sql_text TEXT,
+            content_hash TEXT,
+            source_hash TEXT,
+            status TEXT,
+            verified INTEGER DEFAULT 0,
+            last_error TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(project_name, file_path)
+        );
+        """
+
         idx_log_status = "CREATE INDEX IF NOT EXISTS idx_log_status ON migration_logs(status);"
         idx_log_project = """
             CREATE INDEX IF NOT EXISTS idx_log_project
@@ -104,6 +142,8 @@ class DBManager:
                 cursor.execute(idx_log_status)
                 cursor.execute(idx_log_project)
                 cursor.execute(idx_log_project_file)
+                cursor.execute(source_assets_ddl)
+                cursor.execute(rendered_outputs_ddl)
 
                 # Add missing columns for existing installations
                 self._ensure_column(
@@ -137,7 +177,182 @@ class DBManager:
                     "ALTER TABLE migration_logs ADD COLUMN executed_statements INTEGER DEFAULT 0",
                 )
 
+                self._ensure_column(
+                    cursor,
+                    "source_assets",
+                    "selected_for_port",
+                    "ALTER TABLE source_assets ADD COLUMN selected_for_port INTEGER DEFAULT 1",
+                )
+                self._ensure_column(
+                    cursor,
+                    "source_assets",
+                    "parsed_schemas",
+                    "ALTER TABLE source_assets ADD COLUMN parsed_schemas TEXT",
+                )
+                self._ensure_column(
+                    cursor,
+                    "source_assets",
+                    "notes",
+                    "ALTER TABLE source_assets ADD COLUMN notes TEXT",
+                )
+
+                self._ensure_column(
+                    cursor,
+                    "rendered_outputs",
+                    "source_hash",
+                    "ALTER TABLE rendered_outputs ADD COLUMN source_hash TEXT",
+                )
+                self._ensure_column(
+                    cursor,
+                    "rendered_outputs",
+                    "verified",
+                    "ALTER TABLE rendered_outputs ADD COLUMN verified INTEGER DEFAULT 0",
+                )
+                self._ensure_column(
+                    cursor,
+                    "rendered_outputs",
+                    "last_error",
+                    "ALTER TABLE rendered_outputs ADD COLUMN last_error TEXT",
+                )
+
             logger.info(f"Database initialized successfully at {self.db_path}")
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
             raise
+
+    # --- Source asset helpers -------------------------------------------------
+
+    def _hash_sql(self, sql_text: str) -> str:
+        return hashlib.sha256(sql_text.encode("utf-8")).hexdigest()
+
+    def sync_source_asset(
+        self,
+        file_path: str,
+        sql_text: str,
+        parsed_schemas: Optional[str] = None,
+        selected_for_port: bool = True,
+        override_selection: bool = False,
+    ) -> None:
+        content_hash = self._hash_sql(sql_text)
+        file_name = os.path.basename(file_path)
+        selected_flag = 1 if selected_for_port else 0
+        with self.get_cursor(commit=True) as cur:
+            cur.execute(
+                """
+                INSERT INTO source_assets (
+                    project_name, file_name, file_path, sql_text, content_hash, parsed_schemas, selected_for_port, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(project_name, file_path) DO UPDATE SET
+                    sql_text = excluded.sql_text,
+                    content_hash = excluded.content_hash,
+                    parsed_schemas = COALESCE(excluded.parsed_schemas, source_assets.parsed_schemas),
+                    selected_for_port = CASE WHEN ? THEN excluded.selected_for_port ELSE source_assets.selected_for_port END,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    self.project_name,
+                    file_name,
+                    file_path,
+                    sql_text,
+                    content_hash,
+                    parsed_schemas,
+                    selected_flag,
+                    1 if override_selection else 0,
+                ),
+            )
+
+    def list_source_assets(
+        self,
+        only_selected: bool = False,
+        only_changed: bool = False,
+    ) -> List[sqlite3.Row]:
+        base_sql = [
+            """
+            SELECT sa.*, ro.source_hash, ro.status AS last_status, ml.status AS log_status
+            FROM source_assets sa
+            LEFT JOIN rendered_outputs ro
+              ON sa.project_name = ro.project_name AND sa.file_path = ro.file_path
+            LEFT JOIN migration_logs ml
+              ON sa.project_name = ml.project_name AND sa.file_path = ml.file_path
+            WHERE sa.project_name = ?
+            """
+        ]
+        params: List = [self.project_name]
+        if only_selected:
+            base_sql.append("AND sa.selected_for_port = 1")
+        if only_changed:
+            base_sql.append(
+                "AND (ro.source_hash IS NULL OR ro.source_hash != sa.content_hash)"
+            )
+        sql = "\n".join(base_sql) + "\nORDER BY sa.file_name"
+        with self.get_cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+    def set_selection(self, file_names: Iterable[str], selected: bool = True) -> int:
+        names = list(file_names)
+        if not names:
+            return 0
+        placeholders = ",".join(["?"] * len(names))
+        sql = f"""
+            UPDATE source_assets
+            SET selected_for_port = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE project_name = ? AND file_name IN ({placeholders})
+        """
+        with self.get_cursor(commit=True) as cur:
+            cur.execute(sql, [1 if selected else 0, self.project_name, *names])
+            return cur.rowcount
+
+    # --- Output helpers -------------------------------------------------------
+
+    def save_rendered_output(
+        self,
+        file_path: str,
+        sql_text: str,
+        source_hash: Optional[str] = None,
+        status: Optional[str] = None,
+        verified: bool = False,
+        last_error: Optional[str] = None,
+    ) -> None:
+        content_hash = self._hash_sql(sql_text) if sql_text else None
+        file_name = os.path.basename(file_path)
+        with self.get_cursor(commit=True) as cur:
+            cur.execute(
+                """
+                INSERT INTO rendered_outputs (
+                    project_name, file_name, file_path, sql_text, content_hash, source_hash, status, verified, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(project_name, file_path) DO UPDATE SET
+                    sql_text = excluded.sql_text,
+                    content_hash = excluded.content_hash,
+                    source_hash = excluded.source_hash,
+                    status = excluded.status,
+                    verified = excluded.verified,
+                    last_error = excluded.last_error,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    self.project_name,
+                    file_name,
+                    file_path,
+                    sql_text,
+                    content_hash,
+                    source_hash,
+                    status,
+                    1 if verified else 0,
+                    last_error,
+                ),
+            )
+
+    def fetch_rendered_sql(self, file_names: Optional[Iterable[str]] = None) -> List[sqlite3.Row]:
+        params: List = [self.project_name]
+        base_sql = "SELECT * FROM rendered_outputs WHERE project_name = ?"
+        if file_names:
+            names = list(file_names)
+            placeholders = ",".join(["?"] * len(names))
+            base_sql += f" AND file_name IN ({placeholders})"
+            params.extend(names)
+        base_sql += " ORDER BY file_name"
+        with self.get_cursor() as cur:
+            cur.execute(base_sql, params)
+            return cur.fetchall()

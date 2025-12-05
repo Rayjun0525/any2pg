@@ -9,7 +9,7 @@
 - 설정 우선 제어: 로깅, 어댑터, 검증 옵션, LLM 설정 모두 YAML로 관리.
 
 ## 2) 아키텍처 한눈에 보기
-- **CLI (src/main.py):** `--init`, `--run`, `--reset-logs`와 `--config`, `--db-file`, `--log-level`, `--log-file` 오버라이드.
+- **CLI (src/main.py):** `--init`, `--run`, `--reset-logs` 외에 `--mode assets/export/apply/quality`로 SQLite에 적재된 입력·출력 자산을 조회/내보내기/직접 적용하거나 품질 게이트를 점검할 수 있으며, `--config`, `--db-file`, `--log-level`, `--log-file` 오버라이드 지원.
 - **추출기 (src/modules/metadata_extractor.py):** 설정된 스키마를 순회해 결과를 SQLite(`schema_objects`, `migration_logs`)에 저장.
 - **RAG 컨텍스트 빌더 (src/modules/context_builder.py):** SQLGlot으로 SQL을 파싱하고 SQLite에서 관련 객체를 조회.
 - **워크플로우 (src/agents/workflow.py):** LangGraph 상태 머신으로 변환 ➜ 리뷰 ➜ 검증 ➜ 보정 루프 수행.
@@ -30,10 +30,14 @@
 
 ## 4) 전체 실행 흐름
 1. **메타데이터 모드 (`--mode metadata` 또는 `--init`)**: 소스 DB에 연결해 설정된 스키마를 추출하고 SQLite에 캐시합니다. 추출은 읽기 전용이며 원천 DB를 변경하지 않습니다.
-2. **포팅 모드 (`--mode port` 또는 `--run`, 기본)**: `project.source_dir`의 SQL 파일을 읽어 변환/리뷰/검증을 수행하고 결과를 `project.target_dir`에 기록합니다. 검증은 BEGIN/ROLLBACK 트랜잭션으로 감싸며, 위험 DDL/DML이나 프로시저 호출은 `verification.*` 설정을 허용하기 전까지 건너뜁니다. 진행 상황은 `migration_logs`에 `PENDING/DONE/FAILED/...` 상태로 저장됩니다.
+2. **포팅 모드 (`--mode port` 또는 `--run`, 기본)**: **SQLite를 단일 진리 소스로 사용**합니다. `project.auto_ingest_source_dir`가 `true`일 때만 `project.source_dir`을 스캔해 `source_assets`로 동기화하고, 이후 모든 단계는 SQLite 레코드를 기준으로 처리합니다. 변환 결과는 항상 `rendered_outputs`에 저장되며, `project.mirror_outputs`가 `true`일 때만 `project.target_dir`로 파일을 미러링합니다. 검증은 BEGIN/ROLLBACK 트랜잭션으로 감싸며, 위험 DDL/DML이나 프로시저 호출은 `verification.*` 설정을 허용하기 전까지 건너뜁니다. 진행 상황은 `migration_logs`에 `PENDING/DONE/FAILED/...` 상태로 저장됩니다.
 3. **리포트 모드 (`--mode report`)**: SQLite에 축적된 변환 결과를 `project.name` 단위로 조회하고, 스키마/상태 필터로 보고서를 좁힐 수 있습니다. 스킵된 문장과 재시도 횟수도 함께 표시됩니다.
-4. **로그 리셋 (`--reset-logs`)**: 현재 `project.name`에 해당하는 `migration_logs`를 초기화해 모든 파일을 다시 처리합니다.
-5. **회복력**: 재실행 시 `DONE` 상태는 건너뛰며, 재시도는 `project.max_retries`에 도달하면 중단됩니다.
+4. **자산 모드 (`--mode assets`)**: SQLite에 적재된 입력 SQL 자산을 조회하고 선택 여부를 확인합니다(`--only-selected`, `--changed-only`, `--show-sql` 지원).
+5. **추출 모드 (`--mode export`)**: SQLite에 저장된 변환 결과를 선택적으로 파일로 내보냅니다(`--changed-only`, `--asset-names`, `--export-dir`).
+6. **직접 적용 모드 (`--mode apply`)**: 선택한 변환 결과를 PostgreSQL에 실제 실행합니다(검증과 동일한 안전 필터 적용, `rendered_outputs`/`migration_logs` 업데이트).
+7. **로그 리셋 (`--reset-logs`)**: 현재 `project.name`에 해당하는 `migration_logs`를 초기화해 모든 파일을 다시 처리합니다.
+8. **회복력**: 재실행 시 `DONE` 상태이며 원본 해시가 변하지 않은 항목은 건너뜁니다. 재시도는 `project.max_retries`에 도달하면 중단됩니다.
+9. **품질 점검 모드 (`--mode quality` 또는 `--quality`)**: 샌드박스 SQLite/자산을 사용해 설정/로그 안전성, 스키마 컬럼 존재 여부, 위험 SQL 차단, 자산 저장 여부를 점수화한 리포트를 출력합니다.
 
 ## 5) 빠른 시작
 ```bash
@@ -64,9 +68,11 @@ python src/main.py --mode report --config config.yaml --schema-filter HR
 project:
   name: "example_project"        # 모든 SQLite 행과 리포트를 이 프로젝트명으로 구분
   source_dir: "./input"            # 원본 SQL 파일 위치
-  target_dir: "./output"           # 변환 SQL 출력 위치
+  target_dir: "./output"           # 변환 SQL 파일을 미러링할 경우의 경로
   db_file: "./migration.db"        # 기본 SQLite 경로 (--db-file로 오버라이드 가능)
   max_retries: 5                    # 보정 루프 최대 재시도 횟수
+  auto_ingest_source_dir: true      # true면 매 실행 시 source_dir을 스캔해 SQLite에 적재
+  mirror_outputs: false             # true면 변환 SQL을 target_dir에도 파일로 기록
 
 logging:
   level: "INFO"                     # DEBUG, INFO, WARNING, ERROR
@@ -106,6 +112,8 @@ rules:                                # 리뷰어에게 전달할 가이드 문�
 
 ## 7) SQLite 스키마
 - **schema_objects**: `obj_id`(PK), `project_name`, `schema_name`, `obj_name`, `obj_type`, `ddl_script`, `source_code`, `extracted_at`. `(project_name, schema_name, obj_name, obj_type)`로 유니크 보장.
+- **source_assets**: `asset_id`(PK), `project_name`, `file_name`, `file_path`, `sql_text`, `content_hash`, `parsed_schemas`, `selected_for_port`, `notes`, `created_at`, `updated_at`. 원본 SQL을 SQLite로 일원화하며 해시/선택 상태를 포함합니다.
+- **rendered_outputs**: `output_id`(PK), `project_name`, `asset_id`, `file_name`, `file_path`, `sql_text`, `content_hash`, `source_hash`, `status`, `verified`, `last_error`, `updated_at`. 변환물과 검증/적용 상태를 보관하며 `source_hash`로 최신 여부를 판단합니다.
 - **migration_logs / 리포트 소스**: `project_name`, `file_path`, `detected_schemas`, `status`, `retry_count`, `last_error_msg`, `target_path`, `skipped_statements`, `executed_statements`, `updated_at`. `(project_name, file_path)` 유니크로 동일 SQLite 파일을 여러 프로젝트가 안전하게 공유.
   - `detected_schemas`는 파싱된 SQL 참조로부터 파생되어, 스키마 기반 필터를 적용해도 프로젝트 간 충돌이 없습니다.
 
@@ -127,6 +135,7 @@ rules:                                # 리뷰어에게 전달할 가이드 문�
 - 방어적 설정 검증(경로 확장, 재시도 수 정규화, 필수 키 확인)으로 잘못된 실행을 조기에 차단합니다.
 - SQLite 작업은 모두 트랜잭션 기반이며 오류 시 롤백해 부분 저장을 방지합니다.
 - RAG 컨텍스트 빌더는 파싱 실패 시 안전하게 무시하며, DDL/소스 텍스트를 제공하는 객체만 전달합니다.
+- `--mode quality`는 설정/로그/스키마/안전 필터/자산 저장을 자동 점검해 모든 지표가 10/10인지 확인하는 리포트를 제공합니다.
 - 전체 테스트는 `python -m pytest`로 실행하며, 실 PostgreSQL 스모크 테스트를 위해 `POSTGRES_TEST_DSN`을 설정할 수 있습니다.
 
 ## 11) 개발자 노트

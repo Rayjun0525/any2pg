@@ -1,9 +1,11 @@
 project:
   name: "sample_project"              # Label used to scope rows inside SQLite
   source_dir: "./sample/queries"        # Sample SQL inputs packaged with the repo
-  target_dir: "./output"                # Converted outputs will be written here
+  target_dir: "./output"                # Optional mirror location for converted SQL
   db_file: "./sample/migration.sample.db" # SQLite metadata cache for this sample run
   max_retries: 3                         # Stop self-correction after three attempts per file
+  auto_ingest_source_dir: true           # Ingest sample queries into SQLite on each run
+  mirror_outputs: false                  # Set true to also write files to target_dir
 
 logging:
   level: "DEBUG"                        # DEBUG to observe every stage in the sample
