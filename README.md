@@ -14,6 +14,7 @@ Hybrid SQL migration toolkit that converts heterogeneous SQL (Oracle/MySQL/etc.)
 - **RAG Context Builder (src/modules/context_builder.py):** parses SQL with SQLGlot, fetches related objects by name + schema from SQLite.
 - **Workflow (src/agents/workflow.py):** LangGraph-driven state machine for transpile ➜ review ➜ verify ➜ corrective rewrite.
 - **Verifier (src/modules/postgres_verifier.py):** executes statements on PostgreSQL with `autocommit=False` and unconditional rollback; shims live in `src/context_builder_shim.py` and `src/postgres_verifier_shim.py` for legacy imports.
+- **TUI (src/ui/tui.py):** curses-based menu launched by default (when `--mode` is omitted) to drive metadata collection/browsing, porting/resume, export/apply, logs, and quality checks.
 
 ## 3) Supported Source Adapters
 | Source DB       | Config `database.source.type` | Adapter Path                      | Extracts Tables/Views | Extracts Routines |
@@ -35,40 +36,46 @@ Hybrid SQL migration toolkit that converts heterogeneous SQL (Oracle/MySQL/etc.)
 4. **Reset logs (`--reset-logs`)**: clears `migration_logs` for the current `project.name` to reprocess files.
 5. **Resilience**: reruns skip rows marked `DONE`; retries stop once `project.max_retries` is reached.
 
-## 5) Quickstart
+## 5) Quickstart (TUI-first)
 ```bash
 # 0) Install deps
 python -m pip install -r requirements.txt
 
-# 1) Inspect options
-python src/main.py --help
-
-# 2) Copy sample config and adjust connection URIs/schemas
+# 1) Copy the sample config and adjust connection URIs/schemas
 cp sample/config.sample.yaml ./config.yaml
 
-# 3) Initialize metadata DB (override defaults if desired)
-python src/main.py --init --config config.yaml --db-file "./project_A.db" --log-level DEBUG --log-file "./logs/any2pg.log"
+# 2) Launch the TUI (default) and follow the menus
+python src/main.py --config config.yaml
 
-# 4) Run conversion (can resume after interruption)
-python src/main.py --run --config config.yaml --db-file "./project_A.db"
-
-# 5) Reset statuses when you want to rerun all files
-python src/main.py --reset-logs --config config.yaml --db-file "./project_A.db"
-
-# 6) Inspect results without rerunning conversions
+# 3) CLI equivalents remain available if you prefer scripted runs
+python src/main.py --mode metadata --config config.yaml --db-file "./project_A.db" --log-level DEBUG
+python src/main.py --mode port --config config.yaml --db-file "./project_A.db"
 python src/main.py --mode report --config config.yaml --schema-filter HR
 ```
 
-## 6) Configuration Reference (config.yaml)
+## 6) Interactive TUI workflow (default launch)
+1. **Start the app**: `python src/main.py --config config.yaml` shows the banner with the configured `project.name`/`project.version`.
+2. **Collect metadata**: choose *Collect metadata* to connect to `database.source` and persist schemas + DDL into SQLite (`schema_objects`).
+3. **Status & browse**: the *Status & browse* area groups **Metadata overview** (schemas → objects → DDL/source), **Porting status** (counts + latest rendered outputs), and **Execution logs** (especially useful with `project.silent_mode`/`--silent`).
+4. **Run/Resume porting**: pick *Run/Resume porting*, then choose **FAST** (sqlglot + verifier) or **FULL** (LLM+RAG) mode. Advanced filters are optional; the default run uses the YAML config as-is and simply streams progress.
+5. **Pause/Resume**: if processing stops mid-way, rerun the same menu; only assets not marked `DONE` (or whose hashes changed) will resume.
+6. **Export/Apply**: use *Export rendered SQL* to write outputs to disk or *Apply rendered SQL* to push them to the target DB.
+7. **Quality checks**: run built-in quality gates directly from the menu.
+8. **Silent mode**: enable `project.silent_mode: true` or pass `--silent` to write execution events to SQLite while keeping stdout quiet.
+9. **Navigation**: move with ↑/↓, go back with ←, and select with → or Enter (ESC also closes a menu).
+
+## 7) Configuration Reference (config.yaml)
 ```yaml
 project:
   name: "example_project"        # Project label used to scope all SQLite rows and reports
+  version: "0.1.0"               # Optional banner/version string shown in the TUI header
   source_dir: ""                   # Optional: set only when you want auto-ingest from a filesystem folder
   target_dir: ""                   # Optional mirror location used when mirror_outputs is true
   db_file: "./migration.db"        # Default SQLite path (override via --db-file)
   max_retries: 5                    # Stop correction loop after this many failures
   auto_ingest_source_dir: false     # Disabled by default; enable to pull .sql files from source_dir into SQLite
   mirror_outputs: false             # If true, also write rendered SQL files to target_dir in addition to SQLite
+  silent_mode: false                # When true, suppress stdout and store execution logs in SQLite (override with --silent)
 
 logging:
   level: "INFO"                     # DEBUG, INFO, WARNING, ERROR
@@ -91,6 +98,7 @@ database:
     statement_timeout_ms: 5000      # Optional PG statement_timeout during verification
 
 llm:
+  mode: "full"                   # fast | full — fast = transpile+verify only; full adds LLM review and fixes
   provider: "ollama"               # Interface handled by LangChain
   model: "gemma:7b"
   base_url: "http://localhost:11434"
@@ -106,18 +114,19 @@ rules:                                # Free-form guidance strings for the revie
   - "Replace SYSDATE with CURRENT_TIMESTAMP."
 ```
 
-## 7) SQLite Schema
+## 8) SQLite Schema
 - **schema_objects**: `obj_id` (PK), `project_name`, `schema_name`, `obj_name`, `obj_type`, `ddl_script`, `source_code`, `extracted_at`. Uniqueness on `(project_name, schema_name, obj_name, obj_type)`.
 - **migration_logs / report source**: `project_name`, `file_path`, `detected_schemas`, `status`, `retry_count`, `last_error_msg`, `target_path`, `skipped_statements`, `executed_statements`, `updated_at`. Unique on `(project_name, file_path)` so multiple projects can reuse one SQLite file.
   - `detected_schemas` is derived from parsed SQL references so reports can be filtered by schema lineage without cross-project collisions.
 
-## 8) Sample Assets
+## 9) Sample Assets
 - `sample/config.sample.yaml`: ready-to-copy baseline with Oracle➜Postgres defaults.
 - `sample/queries/*.sql`: three test queries (simple select, join+decode, function call) to validate the workflow. Copy them into `./input` for a dry run.
 
-## 9) Logging & Troubleshooting
+## 10) Logging & Troubleshooting
 - Tuning: adjust `logging.level` for verbosity or override via `--log-level` (or `ANY2PG_LOG_LEVEL`). File output path can be set per run with `--log-file` (`ANY2PG_LOG_FILE`) or in YAML; parent directories are created automatically when needed.
 - Targeted tracing: use `logging.module_levels` to crank up only the noisy components (e.g., `agents.workflow` for stage-by-stage traces, `modules.context_builder` for context queries).
+- Silent runs: set `project.silent_mode: true` or pass `--silent` to suppress stdout and capture execution events into SQLite (`execution_logs`). Open *Progress & logs* in the TUI to read them.
 - Verification safety: verifier wraps execution in explicit `BEGIN`/`ROLLBACK`; dangerous DDL/DML and procedure calls are skipped unless `verification.allow_dangerous_statements` / `verification.allow_procedure_execution` are enabled. Statement timeout is configurable. Data parity is **not** auto-checked—compare source/target data manually after review.
 - Adapter issues: most adapters rely on SQLAlchemy inspectors; missing dialect drivers will raise import/connection errors—install the correct driver for your source DB.
 - Resume logic: if a file remains in `FAILED`/`VERIFY_FAIL`, inspect `migration_logs.last_error_msg` and increase `project.max_retries` if needed.
@@ -125,17 +134,17 @@ rules:                                # Free-form guidance strings for the revie
 - Deterministic context: the RAG context builder orders schema objects consistently (`schema_name`, `obj_type`, `obj_name`) so reviewer prompts are reproducible across runs.
 - Reporting: `--mode report --schema-filter HR` prints SQLite-backed results for the active `project.name` (no cross-project leakage) including skipped statements and retry counts.
 
-## 10) Quality Gates & Testing
+## 11) Quality Gates & Testing
 - Defensive config validation (paths expanded, retries coerced to integer, required keys enforced) guards against accidental misconfiguration.
 - SQLite operations are fully transactional—write operations roll back on errors to avoid partially persisted metadata.
 - RAG context builder ignores unparsable SQL safely and only emits objects that provide DDL/source text.
 - Run the full suite locally with `python -m pytest`; set `POSTGRES_TEST_DSN` to enable live PostgreSQL smoke tests.
 
-## 11) Developer Notes
+## 12) Developer Notes
 - Primary code lives under `src/modules/` (metadata_extractor, context_builder, postgres_verifier, adapters). LangGraph workflow and prompts sit under `src/agents/`.
 - Backward compatibility shims: `src/context_builder_shim.py` and `src/postgres_verifier_shim.py` re-export their implementations—new code should import from `src/modules/` paths directly.
-- All comments/docstrings are in English for consistency; user-facing CLI messages remain bilingual where helpful.
+- Comments/docstrings and user-facing CLI/TUI messages are written in English for consistency. A Korean README is provided separately (`README_KR.md`).
 
-## 12) Live Database Verification (PostgreSQL / Oracle)
+## 13) Live Database Verification (PostgreSQL / Oracle)
 - PostgreSQL smoke tests: set `POSTGRES_TEST_DSN` (e.g., `postgresql://user:pass@localhost:5432/any2pg_test`) and run `python -m pytest -q` to execute the `tests/integration/test_postgres_live.py` suite. The verifier runs inside a transaction and rolls back every statement.
 - Oracle smoke tests: an Oracle instance is required but not bundled; set `ORACLE_TEST_DSN` and add analogous fixtures before enabling end-to-end Oracle checks.

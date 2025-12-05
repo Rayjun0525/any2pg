@@ -1,11 +1,13 @@
 project:
   name: "sample_project"              # Label used to scope rows inside SQLite
+  version: "sample"                    # Optional version label shown in the TUI header
   source_dir: "./sample/queries"        # Optional: enable auto_ingest_source_dir to pull these bundled samples
   target_dir: ""                        # Only needed when mirror_outputs is true
   db_file: "./sample/migration.sample.db" # SQLite metadata cache for this sample run
   max_retries: 3                         # Stop self-correction after three attempts per file
   auto_ingest_source_dir: false          # Disabled by default; set true to ingest the sample queries
   mirror_outputs: false                  # Set true to also write files to target_dir
+  silent_mode: false                     # When true, suppress stdout and log events to SQLite
 
 logging:
   level: "DEBUG"                        # DEBUG to observe every stage in the sample
@@ -27,6 +29,7 @@ database:
     statement_timeout_ms: 8000           # Abort verification queries taking longer than 8s
 
 llm:
+  mode: "full"                         # fast | full — fast skips LLM review and fixes
   provider: "ollama"                    # Aligns with the default quickstart
   model: "gemma:7b"
   base_url: "http://localhost:11434"
