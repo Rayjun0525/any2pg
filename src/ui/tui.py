@@ -36,31 +36,28 @@ class TUIApplication:
             choice = self._menu(
                 "Any2PG | Database Migration Assistant",
                 [
+                    "Status & browse",
                     "Collect metadata",
-                    "Browse metadata",
                     "Run/Resume porting",
-                    "Progress & logs",
                     "Export rendered SQL",
                     "Apply rendered SQL",
                     "Quality checks",
                     "Exit",
                 ],
             )
-            if choice is None or choice == 7:
+            if choice is None or choice == 6:
                 break
             if choice == 0:
-                self._handle_metadata_collection()
+                self._handle_status_and_browse()
             elif choice == 1:
-                self._handle_metadata_browser()
+                self._handle_metadata_collection()
             elif choice == 2:
                 self._handle_porting()
             elif choice == 3:
-                self._handle_progress_and_logs()
-            elif choice == 4:
                 self._handle_export()
-            elif choice == 5:
+            elif choice == 4:
                 self._handle_apply()
-            elif choice == 6:
+            elif choice == 5:
                 self._handle_quality()
 
     def _menu(self, title: str, options: List[str]) -> Optional[int]:
@@ -74,13 +71,21 @@ class TUIApplication:
             for i, opt in enumerate(options):
                 prefix = "▶" if i == idx else " "
                 self.stdscr.addstr(5 + i, 4, f"{prefix} {opt}")
-            self.stdscr.addstr(5 + len(options) + 1, 4, "Use ↑/↓ to move, Enter to select, ESC to exit")
+            self.stdscr.addstr(
+                5 + len(options) + 1,
+                4,
+                "Use ↑/↓ to move, ← to go back, → or Enter to select, ESC to exit",
+            )
             self.stdscr.refresh()
             key = self.stdscr.getch()
             if key in (curses.KEY_UP, ord('k')):
                 idx = (idx - 1) % len(options)
             elif key in (curses.KEY_DOWN, ord('j')):
                 idx = (idx + 1) % len(options)
+            elif key in (curses.KEY_LEFT, ord('h')):
+                return None
+            elif key in (curses.KEY_RIGHT, ord('l')):
+                return idx
             elif key in (curses.KEY_ENTER, 10, 13):
                 return idx
             elif key in (27,):
@@ -130,6 +135,26 @@ class TUIApplication:
 
     # --- Actions --------------------------------------------------------
 
+    def _handle_status_and_browse(self) -> None:
+        while True:
+            choice = self._menu(
+                "Status",
+                [
+                    "Metadata overview",
+                    "Porting status",
+                    "Execution logs",
+                    "Back",
+                ],
+            )
+            if choice is None or choice == 3:
+                return
+            if choice == 0:
+                self._show_metadata_browser()
+            elif choice == 1:
+                self._show_progress()
+            elif choice == 2:
+                self._show_logs()
+
     def _handle_metadata_collection(self) -> None:
         action = self.actions.get("metadata")
         if not action:
@@ -139,10 +164,10 @@ class TUIApplication:
         output = self._capture_output(action, self.config)
         self._show_text("Metadata collection finished", output or "Done")
 
-    def _handle_metadata_browser(self) -> None:
+    def _show_metadata_browser(self) -> None:
         schemas = [row["schema_name"] for row in self.db.list_schemas()]
         if not schemas:
-            self._show_text("Browse metadata", "No schemas are stored yet. Run metadata collection first.")
+            self._show_text("Metadata", "No schemas are stored yet. Run metadata collection first.")
             return
         schema_idx = self._menu("Select a schema", schemas)
         if schema_idx is None:
@@ -150,7 +175,7 @@ class TUIApplication:
         schema = schemas[schema_idx]
         objects = self.db.list_schema_objects(schema)
         if not objects:
-            self._show_text("Browse metadata", "No objects are stored under this schema.")
+            self._show_text("Metadata", "No objects are stored under this schema.")
             return
         labels = [f"{row['obj_type']}: {row['obj_name']}" for row in objects]
         obj_idx = self._menu(f"{schema} objects", labels)
@@ -170,19 +195,30 @@ class TUIApplication:
         self._show_text("Object detail", "\n".join(body_parts))
 
     def _handle_porting(self) -> None:
-        mode_choice = self._menu("Choose a porting mode", ["FAST (sqlglot)", "FULL (LLM+RAG)", "Cancel"])
+        mode_choice = self._menu("Choose a porting mode", ["FAST (sqlglot)", "FULL (LLM+RAG)", "Back"])
         if mode_choice is None or mode_choice == 2:
             return
         self.config.setdefault("llm", {})["mode"] = "fast" if mode_choice == 0 else "full"
-        only_selected = self._prompt_yes_no("Process only assets marked as selected?", True)
-        changed_only = self._prompt_yes_no("Process only assets flagged as changed?", False)
-        names_raw = self._prompt("Specific file names (comma-separated, leave empty for all)", "").strip()
-        asset_names = {n.strip() for n in names_raw.split(',') if n.strip()} if names_raw else None
         action = self.actions.get("port")
         if not action:
             self._show_text("Run porting", "No porting handler is configured.")
             return
-        self._show_text("Run porting", "Running migration with the selected options...")
+
+        # Simple run using config defaults; optional filters stay hidden unless requested.
+        use_filters = self._prompt_yes_no("Use advanced filters (selected/changed/named)?", False)
+        only_selected = False
+        changed_only = False
+        asset_names = None
+        if use_filters:
+            only_selected = self._prompt_yes_no("Process only assets marked as selected?", True)
+            changed_only = self._prompt_yes_no("Process only assets flagged as changed?", False)
+            names_raw = self._prompt("Specific file names (comma-separated, leave empty for all)", "").strip()
+            asset_names = {n.strip() for n in names_raw.split(',') if n.strip()} if names_raw else None
+
+        self._show_text(
+            "Run porting",
+            "Running migration using config defaults. Progress will stream to stdout; summary will appear here when complete.",
+        )
         output = self._capture_output(
             action,
             self.config,
@@ -200,22 +236,35 @@ class TUIApplication:
             summary_lines.append("\n" + output)
         self._show_text("Porting summary", "\n".join(summary_lines))
 
-    def _handle_progress_and_logs(self) -> None:
+    def _show_progress(self) -> None:
         progress = self.db.summarize_migration()
         lines = [f"Project: {self.project_name}", "Version: {self.project_version}", ""]
         if progress:
             lines.append("[Conversion status]")
             lines.extend([f"- {row['status']}: {row['count']}" for row in progress])
             lines.append("")
+        else:
+            lines.append("No conversion progress recorded yet.")
+            lines.append("")
+        outputs = self.db.list_rendered_outputs(limit=20)
+        if outputs:
+            lines.append("[Latest rendered outputs]")
+            for row in outputs:
+                lines.append(
+                    f"{row['file_name']} :: {row['status']} (verified={row['verified']})"
+                )
+        self._show_text("Porting status", "\n".join(lines))
+
+    def _show_logs(self) -> None:
         logs = self.db.fetch_execution_logs(limit=50)
-        lines.append("[Recent execution logs]")
+        lines = ["[Recent execution logs]"]
         if not logs:
             lines.append("No logs recorded yet.")
         else:
             for row in logs:
                 detail = (row["detail"] or "").replace("\n", " ")
                 lines.append(f"{row['created_at']} [{row['level']}] {row['event']} :: {detail}")
-        self._show_text("Status / Logs", "\n".join(lines))
+        self._show_text("Execution logs", "\n".join(lines))
 
     def _handle_export(self) -> None:
         action = self.actions.get("export")
