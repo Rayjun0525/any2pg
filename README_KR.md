@@ -14,6 +14,7 @@
 - **RAG 컨텍스트 빌더 (src/modules/context_builder.py):** SQLGlot으로 SQL을 파싱하고 SQLite에서 관련 객체를 조회.
 - **워크플로우 (src/agents/workflow.py):** LangGraph 상태 머신으로 변환 ➜ 리뷰 ➜ 검증 ➜ 보정 루프 수행.
 - **검증기 (src/modules/postgres_verifier.py):** PostgreSQL을 `autocommit=False`로 실행 후 무조건 롤백; 과거 호환용 쉼은 `src/context_builder_shim.py`, `src/postgres_verifier_shim.py`.
+- **TUI (src/ui/tui.py):** `--mode`를 생략하면 기본으로 실행되는 curses 기반 메뉴로, 메타정보 수집/조회, 포팅/재개, 내보내기/적용, 로그, 품질 검사를 탐색합니다.
 
 ## 3) 지원 소스 어댑터
 | Source DB | Config `database.source.type` | Adapter Path | 테이블/뷰 추출 | 프로시저 추출 |
@@ -39,40 +40,46 @@
 8. **회복력**: 재실행 시 `DONE` 상태이며 원본 해시가 변하지 않은 항목은 건너뜁니다. 재시도는 `project.max_retries`에 도달하면 중단됩니다.
 9. **품질 점검 모드 (`--mode quality` 또는 `--quality`)**: 샌드박스 SQLite/자산을 사용해 설정/로그 안전성, 스키마 컬럼 존재 여부, 위험 SQL 차단, 자산 저장 여부를 점수화한 리포트를 출력합니다.
 
-## 5) 빠른 시작
+## 5) 빠른 시작 (기본 TUI)
 ```bash
 # 0) 의존성 설치
 python -m pip install -r requirements.txt
 
-# 1) 옵션 확인
-python src/main.py --help
-
-# 2) 샘플 설정 복사 후 연결 URI/스키마 수정
+# 1) 샘플 설정 복사 후 연결 URI/스키마 수정
 cp sample/config.sample.yaml ./config.yaml
 
-# 3) 메타데이터 DB 초기화 (필요 시 경로 오버라이드)
-python src/main.py --init --config config.yaml --db-file "./project_A.db" --log-level DEBUG --log-file "./logs/any2pg.log"
+# 2) TUI 실행 (기본 진입점)
+python src/main.py --config config.yaml
 
-# 4) 변환 실행 (중단 후 재개 가능)
-python src/main.py --run --config config.yaml --db-file "./project_A.db"
-
-# 5) 전체 재실행을 위해 상태 초기화
-python src/main.py --reset-logs --config config.yaml --db-file "./project_A.db"
-
-# 6) 재실행 없이 결과만 확인
+# 3) CLI만 사용하고 싶다면
+python src/main.py --mode metadata --config config.yaml --db-file "./project_A.db" --log-level DEBUG
+python src/main.py --mode port --config config.yaml --db-file "./project_A.db"
 python src/main.py --mode report --config config.yaml --schema-filter HR
 ```
 
-## 6) 설정 참조 (config.yaml)
+## 6) 기본 TUI 흐름
+1. **시작**: `python src/main.py --config config.yaml` 실행 시 프로젝트 이름/버전이 포함된 배너와 메뉴가 표시됩니다.
+2. **메타정보 수집**: *메타정보 수집*을 선택하면 `database.source`에 접속해 스키마/DDL을 SQLite(`schema_objects`)에 저장합니다.
+3. **메타정보 조회**: *메타정보 조회*에서 스키마 → 오브젝트 → DDL/소스를 단계별로 확인합니다.
+4. **포팅 실행/재개**: *포팅 실행/재개* 메뉴에서 **FAST(sqlglot+verifier)** 또는 **FULL(LLM+RAG)** 모드를 선택하고, 선택/변경된 자산 또는 특정 파일명으로 범위를 좁힐 수 있습니다.
+5. **중단 후 재개**: 처리 중단 시 동일 메뉴를 다시 실행하면 `DONE`이 아니거나 해시가 바뀐 자산만 이어서 처리합니다.
+6. **내보내기/적용**: *렌더링 내보내기*로 디스크에 저장하거나 *렌더링 적용*으로 타깃 DB에 생성할 수 있습니다.
+7. **현황/로그 확인**: *진행 현황/로그 확인*에서 상태 요약과 `execution_logs`의 실행 로그(사일런트 모드 포함)를 조회합니다.
+8. **품질 검사**: 메뉴에서 바로 품질 게이트를 실행해 점수/경고를 확인합니다.
+9. **사일런트 모드**: `project.silent_mode: true` 또는 `--silent`로 표준출력을 최소화하고 실행 이벤트를 SQLite에 기록합니다.
+
+## 7) 설정 참조 (config.yaml)
 ```yaml
 project:
   name: "example_project"        # 모든 SQLite 행과 리포트를 이 프로젝트명으로 구분
+  version: "0.1.0"               # TUI 헤더에 표시할 선택적 버전/배포명
   source_dir: ""                   # 선택 사항: 파일 시스템 폴더에서 자동 적재할 때만 설정
   target_dir: ""                   # mirror_outputs가 true일 때 사용할 미러링 경로
   db_file: "./migration.db"        # 기본 SQLite 경로 (--db-file로 오버라이드 가능)
   max_retries: 5                    # 보정 루프 최대 재시도 횟수
   auto_ingest_source_dir: false     # 기본값은 비활성화; 파일 시스템에서 가져올 때만 true로 설정
   mirror_outputs: false             # true면 변환 SQL을 target_dir에도 파일로 기록
+  silent_mode: false                # true면 stdout을 최소화하고 실행 로그를 SQLite에 적재(--silent로 오버라이드)
 
 logging:
   level: "INFO"                     # DEBUG, INFO, WARNING, ERROR
@@ -95,6 +102,7 @@ database:
     statement_timeout_ms: 5000      # 검증 시 사용할 PG statement_timeout
 
 llm:
+  mode: "full"                   # fast | full — fast는 LLM 리뷰/수정을 생략
   provider: "ollama"               # LangChain이 인터페이스 처리
   model: "gemma:7b"
   base_url: "http://localhost:11434"
@@ -110,20 +118,21 @@ rules:                                # 리뷰어에게 전달할 가이드 문�
   - "Replace SYSDATE with CURRENT_TIMESTAMP."
 ```
 
-## 7) SQLite 스키마
+## 8) SQLite 스키마
 - **schema_objects**: `obj_id`(PK), `project_name`, `schema_name`, `obj_name`, `obj_type`, `ddl_script`, `source_code`, `extracted_at`. `(project_name, schema_name, obj_name, obj_type)`로 유니크 보장.
 - **source_assets**: `asset_id`(PK), `project_name`, `file_name`, `file_path`, `sql_text`, `content_hash`, `parsed_schemas`, `selected_for_port`, `notes`, `created_at`, `updated_at`. 원본 SQL을 SQLite로 일원화하며 해시/선택 상태를 포함합니다.
 - **rendered_outputs**: `output_id`(PK), `project_name`, `asset_id`, `file_name`, `file_path`, `sql_text`, `content_hash`, `source_hash`, `status`, `verified`, `last_error`, `updated_at`. 변환물과 검증/적용 상태를 보관하며 `source_hash`로 최신 여부를 판단합니다.
 - **migration_logs / 리포트 소스**: `project_name`, `file_path`, `detected_schemas`, `status`, `retry_count`, `last_error_msg`, `target_path`, `skipped_statements`, `executed_statements`, `updated_at`. `(project_name, file_path)` 유니크로 동일 SQLite 파일을 여러 프로젝트가 안전하게 공유.
   - `detected_schemas`는 파싱된 SQL 참조로부터 파생되어, 스키마 기반 필터를 적용해도 프로젝트 간 충돌이 없습니다.
 
-## 8) 샘플 자산
+## 9) 샘플 자산
 - `sample/config.sample.yaml`: Oracle➜Postgres 기본값이 포함된 복사용 샘플.
 - `sample/queries/*.sql`: 세 개의 예제 쿼리(단순 select, join+decode, 함수 호출)로 워크플로를 검증할 수 있습니다. `./input`에 복사해 바로 실행해 보세요.
 
-## 9) 로깅 & 트러블슈팅
+## 10) 로깅 & 트러블슈팅
 - 조정: `logging.level`로 출력 수준을 조절하거나 `--log-level`(`ANY2PG_LOG_LEVEL`)로 1회성 오버라이드하세요. 파일 경로는 `--log-file`(`ANY2PG_LOG_FILE`) 또는 YAML로 지정하며, 필요 시 상위 디렉터리를 자동 생성합니다.
 - 타깃 추적: 특정 모듈만 자세히 보고 싶다면 `logging.module_levels`로 설정합니다(예: 단계별 트레이스를 위한 `agents.workflow`, 컨텍스트 조회 디버깅용 `modules.context_builder`).
+- 사일런트 실행: `project.silent_mode: true` 또는 `--silent`로 표준출력을 최소화하고 실행 이벤트를 SQLite(`execution_logs`)에 적재합니다. TUI의 *진행 현황/로그 확인* 메뉴에서 바로 조회할 수 있습니다.
 - 검증 안전장치: 검증은 명시적 `BEGIN`/`ROLLBACK`으로 감싸며, 위험 DDL/DML과 프로시저 실행은 `verification.allow_dangerous_statements`/`allow_procedure_execution`을 활성화하지 않는 한 건너뜁니다. Statement timeout도 설정 가능. **데이터 동등성 비교는 자동으로 수행되지 않으므로, 실제 데이터 검증은 사용자가 직접 진행해야 합니다.**
 - 어댑터 이슈: 다수의 어댑터는 SQLAlchemy inspector를 사용합니다. 필요한 드라이버가 없으면 import/connection 에러가 발생하므로 소스 DB에 맞는 드라이버를 설치하세요.
 - 재개 로직: `FAILED`/`VERIFY_FAIL` 상태가 남으면 `migration_logs.last_error_msg`를 확인하고 필요 시 `project.max_retries`를 늘리세요.
@@ -131,18 +140,18 @@ rules:                                # 리뷰어에게 전달할 가이드 문�
 - 결정적 컨텍스트: RAG 컨텍스트 빌더는 `schema_name`, `obj_type`, `obj_name` 순으로 정렬된 결과를 반환해 실행마다 동일한 프롬프트를 제공합니다.
 - 리포팅: `--mode report --schema-filter HR`로 활성 `project.name` 범위의 SQLite 결과를 출력하며, 스킵된 문장·재시도 횟수를 포함해 교차 프로젝트 누출 없이 확인할 수 있습니다.
 
-## 10) 품질 게이트 & 테스트
+## 11) 품질 게이트 & 테스트
 - 방어적 설정 검증(경로 확장, 재시도 수 정규화, 필수 키 확인)으로 잘못된 실행을 조기에 차단합니다.
 - SQLite 작업은 모두 트랜잭션 기반이며 오류 시 롤백해 부분 저장을 방지합니다.
 - RAG 컨텍스트 빌더는 파싱 실패 시 안전하게 무시하며, DDL/소스 텍스트를 제공하는 객체만 전달합니다.
 - `--mode quality`는 설정/로그/스키마/안전 필터/자산 저장을 자동 점검해 모든 지표가 10/10인지 확인하는 리포트를 제공합니다.
 - 전체 테스트는 `python -m pytest`로 실행하며, 실 PostgreSQL 스모크 테스트를 위해 `POSTGRES_TEST_DSN`을 설정할 수 있습니다.
 
-## 11) 개발자 노트
+## 12) 개발자 노트
 - 핵심 코드는 `src/modules/`(metadata_extractor, context_builder, postgres_verifier, adapters)에 있으며, LangGraph 워크플로와 프롬프트는 `src/agents/` 아래에 있습니다.
 - 하위 호환을 위해 `src/context_builder_shim.py`, `src/postgres_verifier_shim.py`가 동일 구현을 재노출합니다. 신규 코드는 `src/modules/` 경로를 직접 임포트하세요.
-- 주석/도큐스트링은 일관성을 위해 영어로 유지하지만, CLI 메시지는 필요한 곳에 한/영을 병기합니다.
+- 주석/도큐스트링과 사용자 노출 메시지는 기본적으로 영어를 사용합니다. 한글 안내는 이 `README_KR.md`에만 제공합니다.
 
-## 12) 실 DB 검증 (PostgreSQL / Oracle)
+## 13) 실 DB 검증 (PostgreSQL / Oracle)
 - PostgreSQL 스모크 테스트: `POSTGRES_TEST_DSN`(예: `postgresql://user:pass@localhost:5432/any2pg_test`)을 지정하고 `python -m pytest -q`를 실행하면 `tests/integration/test_postgres_live.py`가 동작합니다. 검증은 트랜잭션 내부에서 수행되며 모든 문장이 롤백됩니다.
 - Oracle 스모크 테스트: 번들되지 않은 외부 Oracle 인스턴스가 필요합니다. `ORACLE_TEST_DSN`을 설정하고 유사한 픽스처를 추가해 엔드 투 엔드 검증을 확장하세요.
