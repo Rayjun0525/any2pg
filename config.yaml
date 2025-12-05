@@ -1,11 +1,13 @@
 project:
   name: "example_project"            # Required project identifier used to scope SQLite rows
+  version: "0.1.0"                   # Optional display version for TUI header and logs
   source_dir: ""                      # Optional: set only when using auto_ingest_source_dir to pull from filesystem
   target_dir: ""                      # Optional mirror directory for converted SQL (used when mirror_outputs is true)
   db_file: "./migration.db"           # Default SQLite path (override with --db-file)
   max_retries: 5                       # Converter loop limit before aborting
   auto_ingest_source_dir: false        # If true, ingest source_dir into SQLite on each run
   mirror_outputs: false                # If true, also write rendered SQL files to target_dir
+  silent_mode: false                   # Suppress stdout and persist execution logs into SQLite (override with --silent)
 
 logging:
   level: "INFO"                        # DEBUG for deep tracing, INFO for normal runs
@@ -29,6 +31,7 @@ database:
     statement_timeout_ms: 5000          # Optional statement_timeout during verification (ms)
 
 llm:
+  mode: "full"                         # fast | full — fast uses only sqlglot+verifier; full adds LLM review/fixes
   provider: "ollama"                    # Provider handled by LangChain
   model: "gemma:7b"                     # Model name exposed by the provider
   base_url: "http://localhost:11434"

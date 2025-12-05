@@ -122,6 +122,17 @@ class DBManager:
         );
         """
 
+        execution_logs_ddl = """
+        CREATE TABLE IF NOT EXISTS execution_logs (
+            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_name TEXT NOT NULL,
+            level TEXT NOT NULL,
+            event TEXT NOT NULL,
+            detail TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+
         idx_log_status = "CREATE INDEX IF NOT EXISTS idx_log_status ON migration_logs(status);"
         idx_log_project = """
             CREATE INDEX IF NOT EXISTS idx_log_project
@@ -144,6 +155,7 @@ class DBManager:
                 cursor.execute(idx_log_project_file)
                 cursor.execute(source_assets_ddl)
                 cursor.execute(rendered_outputs_ddl)
+                cursor.execute(execution_logs_ddl)
 
                 # Add missing columns for existing installations
                 self._ensure_column(
@@ -213,6 +225,25 @@ class DBManager:
                     "rendered_outputs",
                     "last_error",
                     "ALTER TABLE rendered_outputs ADD COLUMN last_error TEXT",
+                )
+
+                self._ensure_column(
+                    cursor,
+                    "execution_logs",
+                    "project_name",
+                    "ALTER TABLE execution_logs ADD COLUMN project_name TEXT DEFAULT 'default'",
+                )
+                self._ensure_column(
+                    cursor,
+                    "execution_logs",
+                    "level",
+                    "ALTER TABLE execution_logs ADD COLUMN level TEXT DEFAULT 'INFO'",
+                )
+                self._ensure_column(
+                    cursor,
+                    "execution_logs",
+                    "event",
+                    "ALTER TABLE execution_logs ADD COLUMN event TEXT",
                 )
 
             logger.info(f"Database initialized successfully at {self.db_path}")
@@ -355,4 +386,90 @@ class DBManager:
         base_sql += " ORDER BY file_name"
         with self.get_cursor() as cur:
             cur.execute(base_sql, params)
+            return cur.fetchall()
+
+    # --- Metadata navigation helpers ----------------------------------------
+
+    def list_schemas(self) -> List[sqlite3.Row]:
+        sql = (
+            "SELECT DISTINCT schema_name FROM schema_objects WHERE project_name = ? "
+            "ORDER BY schema_name"
+        )
+        with self.get_cursor() as cur:
+            cur.execute(sql, (self.project_name,))
+            return cur.fetchall()
+
+    def list_schema_objects(self, schema: Optional[str] = None) -> List[sqlite3.Row]:
+        base_sql = [
+            "SELECT schema_name, obj_name, obj_type, extracted_at FROM schema_objects",
+            "WHERE project_name = ?",
+        ]
+        params: List = [self.project_name]
+        if schema:
+            base_sql.append("AND schema_name = ?")
+            params.append(schema)
+        base_sql.append("ORDER BY schema_name, obj_type, obj_name")
+        with self.get_cursor() as cur:
+            cur.execute("\n".join(base_sql), params)
+            return cur.fetchall()
+
+    def get_object_detail(
+        self, schema: str, obj_name: str, obj_type: Optional[str] = None
+    ) -> Optional[sqlite3.Row]:
+        base_sql = [
+            "SELECT schema_name, obj_name, obj_type, ddl_script, source_code, extracted_at",
+            "FROM schema_objects",
+            "WHERE project_name = ? AND schema_name = ? AND obj_name = ?",
+        ]
+        params: List = [self.project_name, schema, obj_name]
+        if obj_type:
+            base_sql.append("AND obj_type = ?")
+            params.append(obj_type)
+        base_sql.append("ORDER BY obj_type LIMIT 1")
+        with self.get_cursor() as cur:
+            cur.execute("\n".join(base_sql), params)
+            return cur.fetchone()
+
+    # --- Execution log helpers ----------------------------------------------
+
+    def add_execution_log(self, event: str, detail: Optional[str] = None, level: str = "INFO") -> None:
+        with self.get_cursor(commit=True) as cur:
+            cur.execute(
+                """
+                INSERT INTO execution_logs (project_name, level, event, detail)
+                VALUES (?, ?, ?, ?)
+                """,
+                (self.project_name, level.upper(), event, detail),
+            )
+
+    def fetch_execution_logs(
+        self, limit: int = 200, level: Optional[str] = None
+    ) -> List[sqlite3.Row]:
+        base_sql = [
+            "SELECT project_name, level, event, detail, created_at",
+            "FROM execution_logs",
+            "WHERE project_name = ?",
+        ]
+        params: List = [self.project_name]
+        if level:
+            base_sql.append("AND level = ?")
+            params.append(level.upper())
+        base_sql.append("ORDER BY log_id DESC LIMIT ?")
+        params.append(limit)
+        with self.get_cursor() as cur:
+            cur.execute("\n".join(base_sql), params)
+            return cur.fetchall()
+
+    def summarize_migration(self) -> List[sqlite3.Row]:
+        with self.get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, COUNT(*) as count
+                FROM migration_logs
+                WHERE project_name = ?
+                GROUP BY status
+                ORDER BY status
+                """,
+                (self.project_name,),
+            )
             return cur.fetchall()

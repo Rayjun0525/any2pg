@@ -38,11 +38,14 @@ class MigrationWorkflow:
         self.source_dialect = config["database"]["source"].get("type", "oracle")
         self.target_dialect = config["database"]["target"].get("type", "postgres")
 
-        self.llm = ChatOllama(
-            base_url=config["llm"]["base_url"],
-            model=config["llm"]["model"],
-            temperature=config["llm"].get("temperature", 0.1),
-        )
+        self.mode = config.get("llm", {}).get("mode", "full").lower()
+        self.llm = None
+        if self.mode != "fast":
+            self.llm = ChatOllama(
+                base_url=config["llm"]["base_url"],
+                model=config["llm"]["model"],
+                temperature=config["llm"].get("temperature", 0.1),
+            )
 
         self.app = self._build_graph()
 
@@ -50,10 +53,19 @@ class MigrationWorkflow:
         workflow = StateGraph(AgentState)
 
         workflow.add_node("transpiler", self.transpiler_node)
-        workflow.add_node("reviewer", self.reviewer_node)
         workflow.add_node("verifier", self.verifier_node)
-        workflow.add_node("converter", self.converter_node)
         workflow.add_node("fail", self.fail_node)
+
+        if self.mode == "fast":
+            workflow.set_entry_point("transpiler")
+            workflow.add_edge("transpiler", "verifier")
+            workflow.add_conditional_edges(
+                "verifier", self.check_verification, {"success": END, "fail": "fail"}
+            )
+            return workflow.compile()
+
+        workflow.add_node("reviewer", self.reviewer_node)
+        workflow.add_node("converter", self.converter_node)
 
         workflow.set_entry_point("transpiler")
         workflow.add_edge("transpiler", "reviewer")
