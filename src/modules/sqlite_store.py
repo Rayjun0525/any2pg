@@ -388,6 +388,17 @@ class DBManager:
             cur.execute(base_sql, params)
             return cur.fetchall()
 
+    def list_rendered_outputs(self, limit: int = 100) -> List[sqlite3.Row]:
+        sql = (
+            "SELECT file_name, status, verified, updated_at "
+            "FROM rendered_outputs "
+            "WHERE project_name = ? "
+            "ORDER BY updated_at DESC LIMIT ?"
+        )
+        with self.get_cursor() as cur:
+            cur.execute(sql, (self.project_name, limit))
+            return cur.fetchall()
+
     # --- Metadata navigation helpers ----------------------------------------
 
     def list_schemas(self) -> List[sqlite3.Row]:
