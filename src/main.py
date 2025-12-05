@@ -522,11 +522,20 @@ def _export_outputs(
     if asset_names:
         filter_names = {n for n in asset_names}
         allowed_names &= filter_names
+        if not allowed_names:
+            logger.warning(
+                "요청한 에셋 이름과 일치하는 결과가 없습니다. (요청: %s)",
+                ", ".join(sorted(filter_names)),
+            )
+            return
+    elif not allowed_names:
+        logger.warning("선택 조건에 맞는 에셋이 없어 내보낼 대상이 없습니다.")
+        return
 
     export_dir = export_dir or project['target_dir']
     os.makedirs(export_dir, exist_ok=True)
 
-    outputs = db.fetch_rendered_sql(allowed_names if allowed_names else None)
+    outputs = db.fetch_rendered_sql(allowed_names)
     if not outputs:
         logger.warning("No rendered outputs available for export.")
         return
@@ -561,8 +570,17 @@ def _apply_outputs(
     if asset_names:
         filter_names = {n for n in asset_names}
         allowed_names &= filter_names
+        if not allowed_names:
+            logger.warning(
+                "요청한 에셋 이름과 일치하는 결과가 없습니다. (요청: %s)",
+                ", ".join(sorted(filter_names)),
+            )
+            return
+    elif not allowed_names:
+        logger.warning("선택 조건에 맞는 에셋이 없어 적용할 대상이 없습니다.")
+        return
 
-    outputs = db.fetch_rendered_sql(allowed_names if allowed_names else None)
+    outputs = db.fetch_rendered_sql(allowed_names)
     if not outputs:
         logger.warning("No rendered outputs found to apply.")
         return
