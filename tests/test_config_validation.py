@@ -1,7 +1,5 @@
 import pytest
 
-import pytest
-
 from src.main import redact_dsn, validate_config
 
 
@@ -39,8 +37,6 @@ def test_validate_config_normalizes_paths(tmp_path, monkeypatch):
     "field, message",
     [
         ("name", "project.name"),
-        ("source_dir", "project.source_dir"),
-        ("target_dir", "project.target_dir"),
         ("db_file", "project.db_file"),
         ("max_retries", "project.max_retries"),
     ],
@@ -50,6 +46,24 @@ def test_validate_config_requires_project_fields(tmp_path, field, message):
     config["project"].pop(field)
 
     with pytest.raises(ValueError, match=message):
+        validate_config(config)
+
+
+def test_validate_config_requires_target_dir_when_mirroring(tmp_path):
+    config = _base_config(tmp_path)
+    config["project"]["mirror_outputs"] = True
+    config["project"]["target_dir"] = ""
+
+    with pytest.raises(ValueError, match="target_dir is required when mirror_outputs"):
+        validate_config(config)
+
+
+def test_validate_config_requires_source_dir_when_auto_ingesting(tmp_path):
+    config = _base_config(tmp_path)
+    config["project"]["auto_ingest_source_dir"] = True
+    config["project"].pop("source_dir")
+
+    with pytest.raises(ValueError, match="source_dir is not set"):
         validate_config(config)
 
 

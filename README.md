@@ -30,7 +30,7 @@ Hybrid SQL migration toolkit that converts heterogeneous SQL (Oracle/MySQL/etc.)
 
 ## 4) End-to-End Workflow
 1. **Metadata mode (`--mode metadata` or `--init`)**: connects to the source DB, extracts configured schemas, caches metadata in SQLite. Extraction uses only inspector/read queries—source DBs are never mutated.
-2. **Port mode (`--mode port` or `--run`, default)**: reads SQL files from `project.source_dir`, performs transpile/review/verify inside PostgreSQL transactions (BEGIN/ROLLBACK), writes to `project.target_dir`, updates `migration_logs` with `PENDING/DONE/FAILED/...` status. Dangerous statements (DROP/INSERT/etc.) and procedure calls are skipped unless explicitly allowed in `verification.*`.
+2. **Port mode (`--mode port` or `--run`, default)**: works *from SQLite first*. SQL files are optionally ingested from `project.source_dir` into `source_assets` (disabled by `project.auto_ingest_source_dir: false`) and every downstream step consumes rows from SQLite. Converted SQL is stored back into `rendered_outputs`; set `project.mirror_outputs: true` if you still want files mirrored to `project.target_dir`. Dangerous statements (DROP/INSERT/etc.) and procedure calls are skipped unless explicitly allowed in `verification.*`.
 3. **Report mode (`--mode report`)**: prints the conversion report from SQLite filtered by `project.name` and optional schema/status filters so you can review skipped statements and retry counts.
 4. **Reset logs (`--reset-logs`)**: clears `migration_logs` for the current `project.name` to reprocess files.
 5. **Resilience**: reruns skip rows marked `DONE`; retries stop once `project.max_retries` is reached.
@@ -63,10 +63,12 @@ python src/main.py --mode report --config config.yaml --schema-filter HR
 ```yaml
 project:
   name: "example_project"        # Project label used to scope all SQLite rows and reports
-  source_dir: "./input"            # Where original SQL files live
-  target_dir: "./output"           # Where converted SQL will be written
+  source_dir: ""                   # Optional: set only when you want auto-ingest from a filesystem folder
+  target_dir: ""                   # Optional mirror location used when mirror_outputs is true
   db_file: "./migration.db"        # Default SQLite path (override via --db-file)
   max_retries: 5                    # Stop correction loop after this many failures
+  auto_ingest_source_dir: false     # Disabled by default; enable to pull .sql files from source_dir into SQLite
+  mirror_outputs: false             # If true, also write rendered SQL files to target_dir in addition to SQLite
 
 logging:
   level: "INFO"                     # DEBUG, INFO, WARNING, ERROR

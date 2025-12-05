@@ -48,25 +48,9 @@ class VerifierAgent:
         if not sql_script or not sql_script.strip():
             return VerificationResult(False, "Empty SQL script")
 
-        try:
-            statements = self._split_statements(sql_script)
-            parsed = sqlglot.parse(sql_script, read="postgres")
-        except ValueError as parse_err:
-            logger.warning("Unable to split SQL script: %s", parse_err)
-            return VerificationResult(False, str(parse_err))
-
-        executable: list[str] = []
-        skipped: list[str] = []
-        for raw, stmt in zip(statements, parsed):
-            classification = self._classify_statement(stmt)
-            if classification == "procedure" and not self.allow_procedures:
-                skipped.append(raw)
-                continue
-            if classification == "dangerous" and not self.allow_dangerous:
-                skipped.append(raw)
-                continue
-            executable.append(raw)
-
+        executable, skipped, prep_error = self._prepare_statements(sql_script)
+        if prep_error:
+            return VerificationResult(False, prep_error)
         if not executable and skipped:
             note = (
                 "All statements skipped due to verification safety settings; "
@@ -137,6 +121,70 @@ class VerifierAgent:
             logger.error(f"Verification system error: {e}")
             return VerificationResult(False, str(e))
 
+    def apply_sql(self, sql_script: str) -> VerificationResult:
+        """Execute converted SQL on the target database with safety filters."""
+
+        if not sql_script or not sql_script.strip():
+            return VerificationResult(False, "Empty SQL script")
+
+        executable, skipped, prep_error = self._prepare_statements(sql_script)
+        if prep_error:
+            return VerificationResult(False, prep_error)
+        if not executable:
+            note = "No executable statements after safety filtering"
+            return VerificationResult(True, None, skipped_statements=skipped, notes=note)
+
+        conn_args = {}
+        if self.statement_timeout_ms:
+            conn_args["options"] = f"-c statement_timeout={self.statement_timeout_ms}"
+
+        logger.info(
+            "Applying SQL to target (uri=%s, timeout_ms=%s, statements=%d, skipped=%d)",
+            self._redact_dsn(self.target_dsn),
+            self.statement_timeout_ms,
+            len(executable),
+            len(skipped),
+        )
+
+        try:
+            with psycopg.connect(self.target_dsn, **conn_args) as conn:
+                with conn.cursor() as cur:
+                    executed = 0
+                    failing_stmt = None
+                    try:
+                        for statement in executable:
+                            failing_stmt = statement
+                            cur.execute(statement)
+                            executed += 1
+                        conn.commit()
+                        return VerificationResult(
+                            True,
+                            None,
+                            skipped_statements=skipped,
+                            executed_statements=executed,
+                            notes="Statements applied to target database.",
+                        )
+                    except psycopg.Error as db_err:
+                        conn.rollback()
+                        diag = getattr(db_err, "diag", None)
+                        primary = getattr(diag, "message_primary", None) if diag else None
+                        context = getattr(diag, "context", None) if diag else None
+                        error_msg = primary or str(db_err) or "Unknown database error"
+                        if context:
+                            error_msg += f" | Context: {context}"
+                        if failing_stmt:
+                            error_msg += f" | SQL: {failing_stmt}"
+                        logger.warning("Target apply failed: %s", error_msg)
+                        return VerificationResult(
+                            False,
+                            error_msg,
+                            skipped_statements=skipped,
+                            executed_statements=executed,
+                        )
+        except Exception as exc:
+            logger.error("Execution error: %s", exc)
+            return VerificationResult(False, str(exc))
+
     def _split_statements(self, sql_script: str) -> list[str]:
         try:
             parsed = sqlglot.parse(sql_script, read="postgres")
@@ -175,7 +223,13 @@ class VerifierAgent:
         if isinstance(stmt, dangerous_nodes):
             # Treat DO blocks and raw commands as procedures when they encapsulate code
             if isinstance(stmt, exp.Command):
-                token = (stmt.this.sql().upper() if getattr(stmt, "this", None) else "")
+                raw_token = getattr(stmt, "this", None)
+                if hasattr(raw_token, "sql"):
+                    token = raw_token.sql().upper()
+                elif isinstance(raw_token, str):
+                    token = raw_token.upper()
+                else:
+                    token = ""
                 if token in {"CALL", "EXEC", "EXECUTE", "DO"}:
                     return "procedure"
             return "dangerous"
@@ -188,3 +242,25 @@ class VerifierAgent:
             return "dangerous"
 
         return "safe"
+
+    def _prepare_statements(self, sql_script: str):
+        try:
+            statements = self._split_statements(sql_script)
+            parsed = sqlglot.parse(sql_script, read="postgres")
+        except ValueError as parse_err:
+            logger.warning("Unable to split SQL script: %s", parse_err)
+            return [], [], str(parse_err)
+
+        executable: list[str] = []
+        skipped: list[str] = []
+        for raw, stmt in zip(statements, parsed):
+            classification = self._classify_statement(stmt)
+            if classification == "procedure" and not self.allow_procedures:
+                skipped.append(raw)
+                continue
+            if classification == "dangerous" and not self.allow_dangerous:
+                skipped.append(raw)
+                continue
+            executable.append(raw)
+
+        return executable, skipped, None
