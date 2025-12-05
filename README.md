@@ -63,11 +63,11 @@ python src/main.py --mode report --config config.yaml --schema-filter HR
 ```yaml
 project:
   name: "example_project"        # Project label used to scope all SQLite rows and reports
-  source_dir: "./input"            # Where original SQL files live
-  target_dir: "./output"           # Optional mirror location for converted SQL (see mirror_outputs)
+  source_dir: ""                   # Optional: set only when you want auto-ingest from a filesystem folder
+  target_dir: ""                   # Optional mirror location used when mirror_outputs is true
   db_file: "./migration.db"        # Default SQLite path (override via --db-file)
   max_retries: 5                    # Stop correction loop after this many failures
-  auto_ingest_source_dir: true      # If true, scan source_dir on each run and ingest into SQLite
+  auto_ingest_source_dir: false     # Disabled by default; enable to pull .sql files from source_dir into SQLite
   mirror_outputs: false             # If true, also write rendered SQL files to target_dir in addition to SQLite
 
 logging:
