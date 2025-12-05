@@ -223,7 +223,13 @@ class VerifierAgent:
         if isinstance(stmt, dangerous_nodes):
             # Treat DO blocks and raw commands as procedures when they encapsulate code
             if isinstance(stmt, exp.Command):
-                token = (stmt.this.sql().upper() if getattr(stmt, "this", None) else "")
+                raw_token = getattr(stmt, "this", None)
+                if hasattr(raw_token, "sql"):
+                    token = raw_token.sql().upper()
+                elif isinstance(raw_token, str):
+                    token = raw_token.upper()
+                else:
+                    token = ""
                 if token in {"CALL", "EXEC", "EXECUTE", "DO"}:
                     return "procedure"
             return "dangerous"
