@@ -263,14 +263,15 @@ def run_migration(config):
     done, failed = 0, 0
     for asset in tqdm(pending_assets, desc="Processing Files"):
         file_path = asset["file_path"]
-        output_path = os.path.join(target_dir, asset["file_name"])
+        file_name = asset["file_name"]
+        output_path = os.path.join(target_dir, file_name)
         source_sql = asset["sql_text"]
 
         ctx_result: Optional[ContextResult] = None
         try:
             ctx_result = rag.build_context(source_sql)
         except Exception:
-            logger.warning("[%s] Failed to pre-compute context; continuing", fname)
+            logger.warning("[%s] Failed to pre-compute context; continuing", file_name)
             ctx_result = None
 
         initial_state = {
@@ -287,7 +288,7 @@ def run_migration(config):
         }
 
         try:
-            logger.info("[%s] Starting workflow", asset["file_name"])
+            logger.info("[%s] Starting workflow", file_name)
             final_state = workflow_engine.app.invoke(initial_state)
 
             if final_state['status'] == 'DONE' and final_state['target_sql']:
@@ -302,12 +303,12 @@ def run_migration(config):
                     last_error=final_state.get('error_msg'),
                 )
                 done += 1
-                logger.info("[%s] Migration complete -> %s", asset["file_name"], output_path)
+                logger.info("[%s] Migration complete -> %s", file_name, output_path)
             else:
                 failed += 1
                 logger.warning(
                     "[%s] status=%s error=%s",
-                    asset["file_name"],
+                    file_name,
                     final_state['status'],
                     final_state['error_msg'],
                 )
@@ -318,7 +319,8 @@ def run_migration(config):
             skipped_blob = "\n".join(skipped) if skipped else None
 
             with db.get_cursor(commit=True) as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO migration_logs (project_name, file_path, detected_schemas, status, retry_count, last_error_msg, target_path, skipped_statements, executed_statements)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_name, file_path) DO UPDATE SET
@@ -330,23 +332,28 @@ def run_migration(config):
                         skipped_statements = excluded.skipped_statements,
                         executed_statements = excluded.executed_statements,
                         updated_at = CURRENT_TIMESTAMP
-                """, (
-                    project_name,
-                    final_state['file_path'],
-                    schemas_text,
-                    final_state['status'],
-                    final_state['retry_count'],
-                    final_state['error_msg'],
-                    output_path if final_state['status'] == 'DONE' else None,
-                    skipped_blob,
-                    final_state.get('executed_statements', 0),
-                ))
+                """,
+                    (
+                        project_name,
+                        final_state['file_path'],
+                        schemas_text,
+                        final_state['status'],
+                        final_state['retry_count'],
+                        final_state['error_msg'],
+                        output_path if final_state['status'] == 'DONE' else None,
+                        skipped_blob,
+                        final_state.get('executed_statements', 0),
+                    ),
+                )
         except Exception:
-            logger.exception("[%s] Critical error processing file", fname)
+            logger.exception("[%s] Critical error processing file", file_name)
             failed += 1
 
     logger.info(
-        f"Run summary: {done} succeeded, {failed} failed/incomplete out of {len(pending_files)} pending files"
+        "Run summary: %s succeeded, %s failed/incomplete out of %s pending assets",
+        done,
+        failed,
+        len(pending_assets),
     )
 
 
