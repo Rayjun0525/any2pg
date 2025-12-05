@@ -12,6 +12,7 @@ from modules.sqlite_store import DBManager
 from modules.metadata_extractor import MetadataExtractor
 from modules.context_builder import ContextResult, RAGContextBuilder
 from modules.postgres_verifier import VerifierAgent
+from quality_check import render_quality_report, run_quality_checks
 from agents.workflow import MigrationWorkflow
 
 logger = logging.getLogger("Any2PG")
@@ -70,6 +71,9 @@ def validate_config(config: dict) -> dict:
     project["name"] = str(project["name"]).strip()
     if not project["name"]:
         raise ValueError("project.name must be a non-empty string")
+
+    project.setdefault("mirror_outputs", False)
+    project.setdefault("auto_ingest_source_dir", True)
 
     project["source_dir"] = expand_path(project["source_dir"])
     project["target_dir"] = expand_path(project["target_dir"])
@@ -188,8 +192,8 @@ def run_init(config):
 
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
-
-    _sync_source_dir(db, config["project"]["source_dir"])
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, config["project"]["source_dir"])
     extractor = MetadataExtractor(config, db)
     extractor.run()
 
@@ -210,15 +214,10 @@ def run_migration(config):
     db_path = config['project']['db_file']
     project_name = config['project']['name']
 
-    if not os.path.isdir(source_dir):
-        raise FileNotFoundError(f"Configured source_dir does not exist: {source_dir}")
-
-    if not os.path.exists(target_dir):
-        os.makedirs(target_dir)
-
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
-    _sync_source_dir(db, source_dir)
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, source_dir)
     source_conf = config['database']['source']
     target_conf = config['database']['target']
     source_dialect = source_conf.get('type', 'oracle')
@@ -227,18 +226,22 @@ def run_migration(config):
     workflow_engine = MigrationWorkflow(config, rag, verifier)
 
     logger.info(
-        "Run starting (project=%s, source_dir=%s, target_dir=%s, db_file=%s, source=%s, target=%s)",
+        "Run starting (project=%s, source_dir=%s, target_dir=%s, db_file=%s, source=%s, target=%s, mirror_outputs=%s)",
         project_name,
         source_dir,
         target_dir,
         db_path,
         source_dialect,
         target_conf.get('type', 'postgres'),
+        config["project"].get("mirror_outputs", False),
     )
     
     assets = db.list_source_assets(only_selected=True)
     if not assets:
-        logger.warning("No SQL assets registered in SQLite (source_dir=%s)", source_dir)
+        logger.warning(
+            "No SQL assets registered in SQLite; populate source_assets via --init, manual inserts, or enabling auto_ingest_source_dir (source_dir=%s)",
+            source_dir,
+        )
         return
 
     pending_assets = []
@@ -292,8 +295,6 @@ def run_migration(config):
             final_state = workflow_engine.app.invoke(initial_state)
 
             if final_state['status'] == 'DONE' and final_state['target_sql']:
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(final_state['target_sql'])
                 db.save_rendered_output(
                     output_path,
                     final_state['target_sql'],
@@ -303,7 +304,13 @@ def run_migration(config):
                     last_error=final_state.get('error_msg'),
                 )
                 done += 1
-                logger.info("[%s] Migration complete -> %s", file_name, output_path)
+                if config["project"].get("mirror_outputs", False):
+                    os.makedirs(target_dir, exist_ok=True)
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        f.write(final_state['target_sql'])
+                    logger.info("[%s] Migration complete -> %s", file_name, output_path)
+                else:
+                    logger.info("[%s] Migration complete (stored in SQLite)", file_name)
             else:
                 failed += 1
                 logger.warning(
@@ -355,6 +362,16 @@ def run_migration(config):
         failed,
         len(pending_assets),
     )
+
+
+def run_quality_audit(config: dict) -> None:
+    """Run internal quality checks and print a scored report."""
+
+    logger.info("Running quality checks against a sandboxed SQLite store")
+    report = run_quality_checks(config)
+    print(render_quality_report(report))
+    if not report.perfect:
+        logger.warning("Quality checks finished with non-perfect scores")
 
 
 
@@ -426,7 +443,8 @@ def _list_assets(
     project_name = config['project']['name']
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
-    _sync_source_dir(db, source_dir)
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, source_dir)
 
     assets = db.list_source_assets(only_selected=only_selected, only_changed=only_changed)
     if asset_names:
@@ -459,7 +477,8 @@ def _update_selection(config: dict, select: Iterable[str], deselect: Iterable[st
     project_name = config['project']['name']
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
-    _sync_source_dir(db, config['project']['source_dir'])
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, config['project']['source_dir'])
     selected = db.set_selection(select, True) if select else 0
     deselected = db.set_selection(deselect, False) if deselect else 0
     if select:
@@ -478,7 +497,8 @@ def _export_outputs(
     project = config['project']
     db = DBManager(project['db_file'], project_name=project['name'])
     db.init_db()
-    _sync_source_dir(db, project['source_dir'])
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, project['source_dir'])
 
     assets = db.list_source_assets(only_selected=only_selected, only_changed=changed_only)
     allowed_names = {a['file_name'] for a in assets}
@@ -515,7 +535,8 @@ def _apply_outputs(
     project = config['project']
     db = DBManager(project['db_file'], project_name=project['name'])
     db.init_db()
-    _sync_source_dir(db, project['source_dir'])
+    if config["project"].get("auto_ingest_source_dir", True):
+        _sync_source_dir(db, project['source_dir'])
     verifier = VerifierAgent(config)
 
     assets = db.list_source_assets(only_selected=only_selected, only_changed=changed_only)
@@ -564,7 +585,7 @@ def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['metadata', 'port', 'report', 'assets', 'export', 'apply'],
+        choices=['metadata', 'port', 'report', 'assets', 'export', 'apply', 'quality'],
         default=None,
         help="Select the operation mode (metadata extraction, porting, or report display)",
     )
@@ -658,6 +679,11 @@ def main():
         default=None,
         help="Restrict export/apply/list to specific asset file names",
     )
+    parser.add_argument(
+        '--quality',
+        action='store_true',
+        help="Run internal quality checks (alias for --mode quality)",
+    )
 
     args = parser.parse_args()
     config = load_config(args.config)
@@ -674,6 +700,8 @@ def main():
         mode = "metadata"
     elif args.run:
         mode = "port"
+    elif args.quality:
+        mode = "quality"
 
     if args.reset_logs:
         run_reset_logs(config)
@@ -709,6 +737,8 @@ def main():
             changed_only=args.changed_only,
             asset_names=args.asset_names,
         )
+    elif mode == "quality":
+        run_quality_audit(config)
     else:
         run_migration(config)
 
