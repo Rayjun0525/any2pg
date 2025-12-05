@@ -67,11 +67,11 @@ python src/main.py --mode report --config config.yaml --schema-filter HR
 ```yaml
 project:
   name: "example_project"        # 모든 SQLite 행과 리포트를 이 프로젝트명으로 구분
-  source_dir: "./input"            # 원본 SQL 파일 위치
-  target_dir: "./output"           # 변환 SQL 파일을 미러링할 경우의 경로
+  source_dir: ""                   # 선택 사항: 파일 시스템 폴더에서 자동 적재할 때만 설정
+  target_dir: ""                   # mirror_outputs가 true일 때 사용할 미러링 경로
   db_file: "./migration.db"        # 기본 SQLite 경로 (--db-file로 오버라이드 가능)
   max_retries: 5                    # 보정 루프 최대 재시도 횟수
-  auto_ingest_source_dir: true      # true면 매 실행 시 source_dir을 스캔해 SQLite에 적재
+  auto_ingest_source_dir: false     # 기본값은 비활성화; 파일 시스템에서 가져올 때만 true로 설정
   mirror_outputs: false             # true면 변환 SQL을 target_dir에도 파일로 기록
 
 logging:
