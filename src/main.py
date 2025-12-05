@@ -1,9 +1,9 @@
 import os
 import sys
-import yaml
 import argparse
 import logging
 from logging.handlers import RotatingFileHandler
+import yaml
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 from tqdm import tqdm
@@ -14,9 +14,27 @@ from modules.context_builder import ContextResult, RAGContextBuilder
 from modules.postgres_verifier import VerifierAgent
 from quality_check import render_quality_report, run_quality_checks
 from agents.workflow import MigrationWorkflow
+from ui.tui import TUIApplication
 
 logger = logging.getLogger("Any2PG")
 logger.addHandler(logging.NullHandler())
+
+
+class SQLiteLogHandler(logging.Handler):
+    """Write log records into the project's SQLite execution log table."""
+
+    def __init__(self, db: DBManager):
+        super().__init__()
+        self.db = db
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            event = record.getMessage()
+            self.db.add_execution_log(event, detail=message, level=record.levelname)
+        except Exception:
+            # Avoid recursive logging loops
+            sys.stderr.write("[SQLiteLogHandler] failed to persist log\n")
 
 
 def redact_dsn(dsn: str) -> str:
@@ -74,6 +92,7 @@ def validate_config(config: dict) -> dict:
 
     project.setdefault("mirror_outputs", False)
     project.setdefault("auto_ingest_source_dir", False)
+    project.setdefault("silent_mode", False)
 
     source_dir = project.get("source_dir")
     target_dir = project.get("target_dir")
@@ -110,7 +129,7 @@ def validate_config(config: dict) -> dict:
     return config
 
 
-def configure_logging(config: dict):
+def configure_logging(config: dict, extra_handlers: Optional[List[logging.Handler]] = None, silent: bool = False):
     logging_conf = config.get("logging", {})
 
     level_name = logging_conf.get("level", "INFO").upper()
@@ -119,7 +138,9 @@ def configure_logging(config: dict):
         "format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers: List[logging.Handler] = []
+    if not silent:
+        handlers.append(logging.StreamHandler(sys.stdout))
     log_file = logging_conf.get("file")
     if log_file:
         log_file = os.path.expanduser(os.path.expandvars(log_file))
@@ -135,7 +156,10 @@ def configure_logging(config: dict):
             )
         )
 
-    logging.basicConfig(level=level, format=fmt, handlers=handlers, force=True)
+    if extra_handlers:
+        handlers.extend(extra_handlers)
+
+    logging.basicConfig(level=level, format=fmt, handlers=handlers or [logging.NullHandler()], force=True)
     module_levels: Dict[str, str] = logging_conf.get("module_levels", {})
     for module_name, module_level in module_levels.items():
         mod_logger = logging.getLogger(module_name)
@@ -156,6 +180,7 @@ def apply_logging_overrides(config: dict, args: argparse.Namespace) -> None:
 
     env_level = os.getenv("ANY2PG_LOG_LEVEL")
     env_file = os.getenv("ANY2PG_LOG_FILE")
+    env_silent = os.getenv("ANY2PG_SILENT")
 
     if args.log_level:
         logging_conf["level"] = args.log_level
@@ -167,6 +192,13 @@ def apply_logging_overrides(config: dict, args: argparse.Namespace) -> None:
         logging_conf["file"] = args.log_file
     elif env_file is not None:
         logging_conf["file"] = env_file
+
+    project_conf = config.setdefault("project", {})
+    silent_flag = getattr(args, "silent", False)
+    if silent_flag:
+        project_conf["silent_mode"] = True
+    elif env_silent is not None:
+        project_conf["silent_mode"] = env_silent.lower() in {"1", "true", "yes"}
 
 
 def _sync_source_dir(db: DBManager, source_dir: str, auto_select: bool = True) -> None:
@@ -195,6 +227,15 @@ def _sync_source_dir(db: DBManager, source_dir: str, auto_select: bool = True) -
             continue
         db.sync_source_asset(file_path, sql_text, selected_for_port=auto_select)
 
+
+def _record_event(config: dict, db: DBManager, event: str, detail: Optional[str] = None, level: str = "INFO") -> None:
+    if not config.get("project", {}).get("silent_mode"):
+        return
+    try:
+        db.add_execution_log(event, detail=detail, level=level)
+    except Exception:
+        logger.debug("Failed to persist execution log for event=%s", event)
+
 def run_init(config):
     """Initialize SQLite storage and extract source metadata."""
     db_path = config['project']['db_file']
@@ -211,8 +252,10 @@ def run_init(config):
     db.init_db()
     if config["project"].get("auto_ingest_source_dir", False):
         _sync_source_dir(db, config["project"]["source_dir"])
+    _record_event(config, db, "metadata:started", detail=f"source={redact_dsn(source_conf.get('uri', ''))}")
     extractor = MetadataExtractor(config, db)
     extractor.run()
+    _record_event(config, db, "metadata:completed")
 
 def run_reset_logs(config):
     """Clear migration log table for a clean retry."""
@@ -224,7 +267,12 @@ def run_reset_logs(config):
         cur.execute("DELETE FROM migration_logs WHERE project_name = ?", (project_name,))
     logger.info("Logs reset complete.")
 
-def run_migration(config):
+def run_migration(
+    config,
+    only_selected: bool = False,
+    changed_only: bool = False,
+    asset_names: Optional[Iterable[str]] = None,
+):
     """Execute the migration workflow for pending SQL files."""
     source_dir = config['project'].get('source_dir')
     target_dir = config['project'].get('target_dir')
@@ -253,13 +301,32 @@ def run_migration(config):
         mirror_outputs,
         auto_ingest,
     )
+    _record_event(
+        config,
+        db,
+        "porting:started",
+        detail=(
+            f"mode={config.get('llm', {}).get('mode', 'full')} "
+            f"mirror={mirror_outputs} selected={only_selected} "
+            f"changed={changed_only} filter={','.join(sorted(asset_names)) if asset_names else 'all'}"
+        ),
+    )
     
-    assets = db.list_source_assets(only_selected=True)
+    assets = db.list_source_assets(only_selected=only_selected, only_changed=changed_only)
     if not assets:
         logger.warning(
             "No SQL assets registered in SQLite; populate source_assets via --init, manual inserts, or enabling auto_ingest_source_dir",
         )
         return
+
+    allowed_names = {a['file_name'] for a in assets}
+    if asset_names:
+        filter_names = {n for n in asset_names}
+        allowed_names &= filter_names
+        assets = [a for a in assets if a['file_name'] in allowed_names]
+        if not allowed_names:
+            logger.warning("No assets matched the provided filters.")
+            return
 
     pending_assets = []
     for asset in assets:
@@ -379,6 +446,13 @@ def run_migration(config):
         failed,
         len(pending_assets),
     )
+    _record_event(
+        config,
+        db,
+        "porting:completed",
+        detail=f"done={done}, failed={failed}, pending={len(pending_assets)}",
+        level="ERROR" if failed else "INFO",
+    )
 
 
 def run_quality_audit(config: dict) -> None:
@@ -389,6 +463,15 @@ def run_quality_audit(config: dict) -> None:
     print(render_quality_report(report))
     if not report.perfect:
         logger.warning("Quality checks finished with non-perfect scores")
+    db = DBManager(config['project']['db_file'], project_name=config['project']['name'])
+    db.init_db()
+    _record_event(
+        config,
+        db,
+        "quality:completed",
+        detail=f"score={report.score:.2f} perfect={report.perfect}",
+        level="INFO" if report.perfect else "WARNING",
+    )
 
 
 
@@ -524,12 +607,12 @@ def _export_outputs(
         allowed_names &= filter_names
         if not allowed_names:
             logger.warning(
-                "요청한 에셋 이름과 일치하는 결과가 없습니다. (요청: %s)",
+                "No rendered outputs matched the requested asset names. (requested: %s)",
                 ", ".join(sorted(filter_names)),
             )
             return
     elif not allowed_names:
-        logger.warning("선택 조건에 맞는 에셋이 없어 내보낼 대상이 없습니다.")
+        logger.warning("No assets matched the current selection filters for export.")
         return
 
     export_dir = export_dir or project['target_dir']
@@ -550,6 +633,12 @@ def _export_outputs(
         with open(dest, 'w', encoding='utf-8') as f:
             f.write(row['sql_text'])
         logger.info("Exported %s -> %s", row['file_name'], dest)
+    _record_event(
+        config,
+        db,
+        "export:completed",
+        detail=f"count={len(outputs)} -> {export_dir}",
+    )
 
 
 def _apply_outputs(
@@ -572,18 +661,20 @@ def _apply_outputs(
         allowed_names &= filter_names
         if not allowed_names:
             logger.warning(
-                "요청한 에셋 이름과 일치하는 결과가 없습니다. (요청: %s)",
+                "No rendered outputs matched the requested asset names. (requested: %s)",
                 ", ".join(sorted(filter_names)),
             )
             return
     elif not allowed_names:
-        logger.warning("선택 조건에 맞는 에셋이 없어 적용할 대상이 없습니다.")
+        logger.warning("No assets matched the current selection filters for apply.")
         return
 
     outputs = db.fetch_rendered_sql(allowed_names)
     if not outputs:
         logger.warning("No rendered outputs found to apply.")
         return
+
+    success, failed = 0, 0
 
     for row in outputs:
         if changed_only and row['file_name'] not in allowed_names:
@@ -602,8 +693,17 @@ def _apply_outputs(
         )
         if result.success:
             logger.info("Applied %s to PostgreSQL (skipped=%d)", row['file_name'], len(result.skipped_statements))
+            success += 1
         else:
             logger.error("Failed applying %s: %s", row['file_name'], result.error)
+            failed += 1
+    _record_event(
+        config,
+        db,
+        "apply:completed",
+        detail=f"success={success}, failed={failed}",
+        level="ERROR" if failed else "INFO",
+    )
 
 
 def main():
@@ -620,7 +720,7 @@ def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['metadata', 'port', 'report', 'assets', 'export', 'apply', 'quality'],
+        choices=['metadata', 'port', 'report', 'assets', 'export', 'apply', 'quality', 'tui'],
         default=None,
         help="Select the operation mode (metadata extraction, porting, or report display)",
     )
@@ -719,18 +819,40 @@ def main():
         action='store_true',
         help="Run internal quality checks (alias for --mode quality)",
     )
+    parser.add_argument(
+        '--llm-mode',
+        choices=['fast', 'full'],
+        default=None,
+        help="Override LLM processing mode for this run",
+    )
+    parser.add_argument(
+        '--silent',
+        action='store_true',
+        help="Suppress stdout and write execution logs into SQLite for later review",
+    )
 
     args = parser.parse_args()
     config = load_config(args.config)
     apply_logging_overrides(config, args)
     config = validate_config(config)
-    configure_logging(config)
+    if args.llm_mode:
+        config.setdefault("llm", {})["mode"] = args.llm_mode
+
+    db_for_logging = DBManager(
+        config["project"]["db_file"], project_name=config["project"]["name"]
+    )
+    db_for_logging.init_db()
+    extra_handlers: List[logging.Handler] = []
+    if config["project"].get("silent_mode"):
+        extra_handlers.append(SQLiteLogHandler(db_for_logging))
+
+    configure_logging(config, extra_handlers=extra_handlers, silent=config["project"].get("silent_mode", False))
 
     # Allow CLI override of SQLite path without editing YAML
     if args.db_file:
         config['project']['db_file'] = args.db_file
 
-    mode = args.mode or config.get("verification", {}).get("mode", "port")
+    mode = args.mode or "tui"
     if args.init:
         mode = "metadata"
     elif args.run:
@@ -774,8 +896,25 @@ def main():
         )
     elif mode == "quality":
         run_quality_audit(config)
+    elif mode == "tui":
+        app = TUIApplication(
+            config,
+            actions={
+                "metadata": run_init,
+                "port": run_migration,
+                "export": _export_outputs,
+                "apply": _apply_outputs,
+                "quality": run_quality_audit,
+            },
+        )
+        app.run()
     else:
-        run_migration(config)
+        run_migration(
+            config,
+            only_selected=args.only_selected,
+            changed_only=args.changed_only,
+            asset_names=args.asset_names,
+        )
 
 
 if __name__ == "__main__":
