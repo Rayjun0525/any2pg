@@ -56,7 +56,7 @@ def validate_config(config: dict) -> dict:
             raise ValueError(f"Missing required config section: {section}")
 
     project = config["project"]
-    for key in ("name", "source_dir", "target_dir", "db_file", "max_retries"):
+    for key in ("name", "db_file", "max_retries"):
         if key not in project:
             raise ValueError(f"project.{key} is required")
 
@@ -73,11 +73,24 @@ def validate_config(config: dict) -> dict:
         raise ValueError("project.name must be a non-empty string")
 
     project.setdefault("mirror_outputs", False)
-    project.setdefault("auto_ingest_source_dir", True)
+    project.setdefault("auto_ingest_source_dir", False)
 
-    project["source_dir"] = expand_path(project["source_dir"])
-    project["target_dir"] = expand_path(project["target_dir"])
+    source_dir = project.get("source_dir")
+    target_dir = project.get("target_dir")
+
+    project["source_dir"] = (
+        expand_path(source_dir) if source_dir not in (None, "") else None
+    )
+    project["target_dir"] = (
+        expand_path(target_dir) if target_dir not in (None, "") else None
+    )
     project["db_file"] = expand_path(project["db_file"])
+
+    if project["mirror_outputs"] and not project["target_dir"]:
+        raise ValueError("project.target_dir is required when mirror_outputs is true")
+
+    if project.get("auto_ingest_source_dir") and not project.get("source_dir"):
+        raise ValueError("project.source_dir is not set but auto_ingest_source_dir is true")
 
     database = config["database"]
     for side in ("source", "target"):
@@ -159,6 +172,10 @@ def apply_logging_overrides(config: dict, args: argparse.Namespace) -> None:
 def _sync_source_dir(db: DBManager, source_dir: str, auto_select: bool = True) -> None:
     """Ingest .sql files from source_dir into SQLite as source_assets."""
 
+    if not source_dir:
+        logger.info("Source directory not configured; skipping filesystem ingest")
+        return
+
     if not os.path.isdir(source_dir):
         logger.warning("Source directory not found for sync: %s", source_dir)
         return
@@ -192,7 +209,7 @@ def run_init(config):
 
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
-    if config["project"].get("auto_ingest_source_dir", True):
+    if config["project"].get("auto_ingest_source_dir", False):
         _sync_source_dir(db, config["project"]["source_dir"])
     extractor = MetadataExtractor(config, db)
     extractor.run()
@@ -209,14 +226,16 @@ def run_reset_logs(config):
 
 def run_migration(config):
     """Execute the migration workflow for pending SQL files."""
-    source_dir = config['project']['source_dir']
-    target_dir = config['project']['target_dir']
+    source_dir = config['project'].get('source_dir')
+    target_dir = config['project'].get('target_dir')
     db_path = config['project']['db_file']
     project_name = config['project']['name']
+    mirror_outputs = config["project"].get("mirror_outputs", False)
+    auto_ingest = config["project"].get("auto_ingest_source_dir", False)
 
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
-    if config["project"].get("auto_ingest_source_dir", True):
+    if auto_ingest:
         _sync_source_dir(db, source_dir)
     source_conf = config['database']['source']
     target_conf = config['database']['target']
@@ -226,21 +245,19 @@ def run_migration(config):
     workflow_engine = MigrationWorkflow(config, rag, verifier)
 
     logger.info(
-        "Run starting (project=%s, source_dir=%s, target_dir=%s, db_file=%s, source=%s, target=%s, mirror_outputs=%s)",
+        "Run starting (project=%s, db_file=%s, source=%s, target=%s, mirror_outputs=%s, auto_ingest=%s)",
         project_name,
-        source_dir,
-        target_dir,
         db_path,
         source_dialect,
         target_conf.get('type', 'postgres'),
-        config["project"].get("mirror_outputs", False),
+        mirror_outputs,
+        auto_ingest,
     )
     
     assets = db.list_source_assets(only_selected=True)
     if not assets:
         logger.warning(
-            "No SQL assets registered in SQLite; populate source_assets via --init, manual inserts, or enabling auto_ingest_source_dir (source_dir=%s)",
-            source_dir,
+            "No SQL assets registered in SQLite; populate source_assets via --init, manual inserts, or enabling auto_ingest_source_dir",
         )
         return
 
@@ -267,7 +284,7 @@ def run_migration(config):
     for asset in tqdm(pending_assets, desc="Processing Files"):
         file_path = asset["file_path"]
         file_name = asset["file_name"]
-        output_path = os.path.join(target_dir, file_name)
+        output_path = os.path.join(target_dir, file_name) if target_dir else file_name
         source_sql = asset["sql_text"]
 
         ctx_result: Optional[ContextResult] = None
@@ -304,7 +321,7 @@ def run_migration(config):
                     last_error=final_state.get('error_msg'),
                 )
                 done += 1
-                if config["project"].get("mirror_outputs", False):
+                if mirror_outputs:
                     os.makedirs(target_dir, exist_ok=True)
                     with open(output_path, 'w', encoding='utf-8') as f:
                         f.write(final_state['target_sql'])
