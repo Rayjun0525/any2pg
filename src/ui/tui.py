@@ -1,6 +1,7 @@
 import curses
 import io
-from contextlib import redirect_stdout
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
 from typing import Callable, Dict, List, Optional
 
 from modules.sqlite_store import DBManager
@@ -14,6 +15,7 @@ class TUIApplication:
         config: dict,
         actions: Optional[Dict[str, Callable]] = None,
     ) -> None:
+        self.BACK = -1
         self.config = config
         self.actions = actions or {}
         project = config.get("project", {})
@@ -40,7 +42,9 @@ class TUIApplication:
                     "런 포팅 (Run/Resume porting)",
                     "상태 확인 (Status & browse)",
                     "익스포트 (Export/Apply)",
+                    "종료 (Quit)",
                 ],
+                allow_quit=True,
             )
             if choice is None:
                 break
@@ -52,8 +56,10 @@ class TUIApplication:
                 self._handle_status_and_browse()
             elif choice == 3:
                 self._handle_export()
+            elif choice == 4 or choice == self.BACK:
+                break
 
-    def _menu(self, title: str, options: List[str]) -> Optional[int]:
+    def _menu(self, title: str, options: List[str], allow_quit: bool = False) -> Optional[int]:
         idx = 0
         while True:
             self.stdscr.clear()
@@ -67,7 +73,7 @@ class TUIApplication:
             self.stdscr.addstr(
                 5 + len(options) + 1,
                 4,
-                "Use ↑/↓ to move, ← to go back, → or Enter to select, ESC to exit",
+                "Use ↑/↓ to move, q/←/ESC to go back, → or Enter to select",
             )
             self.stdscr.refresh()
             key = self.stdscr.getch()
@@ -75,14 +81,14 @@ class TUIApplication:
                 idx = (idx - 1) % len(options)
             elif key in (curses.KEY_DOWN, ord('j')):
                 idx = (idx + 1) % len(options)
-            elif key in (curses.KEY_LEFT, ord('h')):
-                return None
+            elif key in (curses.KEY_LEFT, ord('h'), ord('q'), 27):
+                if allow_quit:
+                    return None
+                return self.BACK
             elif key in (curses.KEY_RIGHT, ord('l')):
                 return idx
             elif key in (curses.KEY_ENTER, 10, 13):
                 return idx
-            elif key in (27,):
-                return None
 
     def _prompt(self, prompt: str, default: str = "") -> str:
         curses.echo()
@@ -122,9 +128,25 @@ class TUIApplication:
 
     def _capture_output(self, func: Callable, *args, **kwargs) -> str:
         buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            func(*args, **kwargs)
-        return buffer.getvalue()
+        with redirect_stdout(buffer), redirect_stderr(buffer):
+            try:
+                func(*args, **kwargs)
+            except Exception:
+                buffer.write("\n[ERROR] Task failed with an exception.\n")
+                buffer.write(traceback.format_exc())
+        return buffer.getvalue().strip()
+
+    def _show_status_banner(self, title: str, body: List[str]) -> None:
+        """Render a non-blocking banner to mimic k9s-like status feedback."""
+
+        self.stdscr.clear()
+        height, width = self.stdscr.getmaxyx()
+        self.stdscr.addstr(1, 2, title[: width - 4])
+        for idx, line in enumerate(body):
+            self.stdscr.addstr(3 + idx, 2, line[: width - 4])
+        footer = "Running... press q to return once results are shown"
+        self.stdscr.addstr(min(height - 2, 4 + len(body)), 2, footer[: width - 4])
+        self.stdscr.refresh()
 
     # --- Actions --------------------------------------------------------
 
@@ -140,8 +162,9 @@ class TUIApplication:
                     "Quality checks",
                     "Back",
                 ],
+                allow_quit=False,
             )
-            if choice is None or choice == 5:
+            if choice in (self.BACK, None) or choice == 5:
                 return
             if choice == 0:
                 self._show_metadata_browser()
@@ -159,9 +182,12 @@ class TUIApplication:
         if not action:
             self._show_text("Metadata collection", "No metadata handler is configured.")
             return
-        self._show_text(
-            "Running",
-            "Collecting metadata from the source database... (once per project is usually enough)",
+        self._show_status_banner(
+            "Metadata collection",
+            [
+                "Collecting metadata from the source database...",
+                "This runs immediately; press q after results to return.",
+            ],
         )
         output = self._capture_output(action, self.config)
         self._show_text("Metadata collection finished", output or "Done")
@@ -171,8 +197,8 @@ class TUIApplication:
         if not schemas:
             self._show_text("Metadata", "No schemas are stored yet. Run metadata collection first.")
             return
-        schema_idx = self._menu("Select a schema", schemas)
-        if schema_idx is None:
+        schema_idx = self._menu("Select a schema", schemas, allow_quit=False)
+        if schema_idx in (self.BACK, None):
             return
         schema = schemas[schema_idx]
         objects = self.db.list_schema_objects(schema)
@@ -180,8 +206,8 @@ class TUIApplication:
             self._show_text("Metadata", "No objects are stored under this schema.")
             return
         labels = [f"{row['obj_type']}: {row['obj_name']}" for row in objects]
-        obj_idx = self._menu(f"{schema} objects", labels)
-        if obj_idx is None:
+        obj_idx = self._menu(f"{schema} objects", labels, allow_quit=False)
+        if obj_idx in (self.BACK, None):
             return
         detail = self.db.get_object_detail(schema, objects[obj_idx]["obj_name"], objects[obj_idx]["obj_type"])
         if not detail:
@@ -197,8 +223,8 @@ class TUIApplication:
         self._show_text("Object detail", "\n".join(body_parts))
 
     def _handle_porting(self) -> None:
-        mode_choice = self._menu("Choose a porting mode", ["FAST (sqlglot)", "FULL (LLM+RAG)", "Back"])
-        if mode_choice is None or mode_choice == 2:
+        mode_choice = self._menu("Choose a porting mode", ["FAST (sqlglot)", "FULL (LLM+RAG)", "Back"], allow_quit=False)
+        if mode_choice in (self.BACK, None) or mode_choice == 2:
             return
         self.config.setdefault("llm", {})["mode"] = "fast" if mode_choice == 0 else "full"
         action = self.actions.get("port")
@@ -226,15 +252,13 @@ class TUIApplication:
             names_raw = self._prompt("Specific file names (comma-separated, leave empty for all)", "").strip()
             asset_names = {n.strip() for n in names_raw.split(',') if n.strip()} if names_raw else None
 
-        self._show_text(
+        self._show_status_banner(
             "Run porting",
-            "\n".join(
-                [
-                    "Running migration using config defaults.",
-                    mode_summary,
-                    "상태는 SQLite에 남으므로 강제 종료되어도 재시작 시 이어집니다.",
-                ]
-            ),
+            [
+                "Running migration using config defaults.",
+                mode_summary,
+                "상태는 SQLite에 남으므로 강제 종료되어도 재시작 시 이어집니다.",
+            ],
         )
         output = self._capture_output(
             action,
@@ -302,8 +326,8 @@ class TUIApplication:
             for row in outputs
         ]
         while True:
-            idx = self._menu("Converted SQL preview", labels + ["Back"])
-            if idx is None or idx == len(labels):
+            idx = self._menu("Converted SQL preview", labels + ["Back"], allow_quit=False)
+            if idx in (self.BACK, None) or idx == len(labels):
                 return
             row = outputs[idx]
             last_error = row["last_error"] if "last_error" in row.keys() else None
@@ -335,8 +359,9 @@ class TUIApplication:
             choice = self._menu(
                 "Export / Apply",
                 ["Export to files", "Apply to target DB", "Back"],
+                allow_quit=False,
             )
-            if choice is None or choice == 2:
+            if choice in (self.BACK, None) or choice == 2:
                 return
             if choice == 0:
                 action = self.actions.get("export")
