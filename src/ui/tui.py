@@ -36,29 +36,22 @@ class TUIApplication:
             choice = self._menu(
                 "Any2PG | Database Migration Assistant",
                 [
-                    "Status & browse",
-                    "Collect metadata",
-                    "Run/Resume porting",
-                    "Export rendered SQL",
-                    "Apply rendered SQL",
-                    "Quality checks",
-                    "Exit",
+                    "메타정보 수집 (Metadata collection)",
+                    "런 포팅 (Run/Resume porting)",
+                    "상태 확인 (Status & browse)",
+                    "익스포트 (Export/Apply)",
                 ],
             )
-            if choice is None or choice == 6:
+            if choice is None:
                 break
             if choice == 0:
-                self._handle_status_and_browse()
-            elif choice == 1:
                 self._handle_metadata_collection()
-            elif choice == 2:
+            elif choice == 1:
                 self._handle_porting()
+            elif choice == 2:
+                self._handle_status_and_browse()
             elif choice == 3:
                 self._handle_export()
-            elif choice == 4:
-                self._handle_apply()
-            elif choice == 5:
-                self._handle_quality()
 
     def _menu(self, title: str, options: List[str]) -> Optional[int]:
         idx = 0
@@ -142,25 +135,34 @@ class TUIApplication:
                 [
                     "Metadata overview",
                     "Porting status",
+                    "Converted SQL preview",
                     "Execution logs",
+                    "Quality checks",
                     "Back",
                 ],
             )
-            if choice is None or choice == 3:
+            if choice is None or choice == 5:
                 return
             if choice == 0:
                 self._show_metadata_browser()
             elif choice == 1:
                 self._show_progress()
             elif choice == 2:
+                self._show_converted_outputs()
+            elif choice == 3:
                 self._show_logs()
+            elif choice == 4:
+                self._handle_quality()
 
     def _handle_metadata_collection(self) -> None:
         action = self.actions.get("metadata")
         if not action:
             self._show_text("Metadata collection", "No metadata handler is configured.")
             return
-        self._show_text("Running", "Collecting metadata from the source database...")
+        self._show_text(
+            "Running",
+            "Collecting metadata from the source database... (once per project is usually enough)",
+        )
         output = self._capture_output(action, self.config)
         self._show_text("Metadata collection finished", output or "Done")
 
@@ -204,6 +206,15 @@ class TUIApplication:
             self._show_text("Run porting", "No porting handler is configured.")
             return
 
+        if mode_choice == 0:
+            mode_summary = (
+                "sqlglot 기반 단일 변환 → SQLite 저장 후 종료. 검증/재시도 없이 빠른 초안만 남깁니다."
+            )
+        else:
+            mode_summary = (
+                "sqlglot 1차 변환 → SQLite 저장 → 랭그래프 검수/검증 → 실패 시 변환 에이전트 재시도 후 검수 재진행."
+            )
+
         # Simple run using config defaults; optional filters stay hidden unless requested.
         use_filters = self._prompt_yes_no("Use advanced filters (selected/changed/named)?", False)
         only_selected = False
@@ -217,7 +228,13 @@ class TUIApplication:
 
         self._show_text(
             "Run porting",
-            "Running migration using config defaults. Progress will stream to stdout; summary will appear here when complete.",
+            "\n".join(
+                [
+                    "Running migration using config defaults.",
+                    mode_summary,
+                    "상태는 SQLite에 남으므로 강제 종료되어도 재시작 시 이어집니다.",
+                ]
+            ),
         )
         output = self._capture_output(
             action,
@@ -238,10 +255,25 @@ class TUIApplication:
 
     def _show_progress(self) -> None:
         progress = self.db.summarize_migration()
-        lines = [f"Project: {self.project_name}", "Version: {self.project_version}", ""]
+        lines = [
+            f"Project: {self.project_name}",
+            f"Version: {self.project_version}",
+            "SQLite에 저장된 단계별 상태를 기반으로 언제든 재개할 수 있습니다.",
+            "",
+        ]
+        status_labels = {
+            "PENDING": "대기/변환 준비",
+            "REVIEW_PASS": "검수 통과",
+            "REVIEW_FAIL": "검수 미통과 (재변환 필요)",
+            "VERIFY_FAIL": "검증 실패",
+            "DONE": "검증 완료",
+            "FAILED": "실패",
+        }
         if progress:
             lines.append("[Conversion status]")
-            lines.extend([f"- {row['status']}: {row['count']}" for row in progress])
+            for row in progress:
+                label = status_labels.get(row["status"], row["status"])
+                lines.append(f"- {label}: {row['count']}")
             lines.append("")
         else:
             lines.append("No conversion progress recorded yet.")
@@ -253,7 +285,39 @@ class TUIApplication:
                 lines.append(
                     f"{row['file_name']} :: {row['status']} (verified={row['verified']})"
                 )
+            lines.append("- 상세 내용은 'Converted SQL preview'에서 확인하세요.")
         self._show_text("Porting status", "\n".join(lines))
+
+    def _show_converted_outputs(self) -> None:
+        outputs = self.db.fetch_rendered_sql()
+        if not outputs:
+            self._show_text(
+                "Converted SQL",
+                "No converted SQL is stored yet. Run a porting job first (FAST or FULL).",
+            )
+            return
+
+        labels = [
+            f"{row['file_name']} :: {row['status']} (verified={bool(row['verified'])})"
+            for row in outputs
+        ]
+        while True:
+            idx = self._menu("Converted SQL preview", labels + ["Back"])
+            if idx is None or idx == len(labels):
+                return
+            row = outputs[idx]
+            last_error = row["last_error"] if "last_error" in row.keys() else None
+            lines = [
+                f"File: {row['file_name']}",
+                f"Status: {row['status']}",
+                f"Verified: {bool(row['verified'])}",
+                f"Updated: {row['updated_at']}",
+                "",
+                row["sql_text"] or "<empty>",
+            ]
+            if last_error:
+                lines.insert(3, f"Last error: {last_error}")
+            self._show_text("Converted SQL", "\n".join(lines))
 
     def _show_logs(self) -> None:
         logs = self.db.fetch_execution_logs(limit=50)
@@ -267,19 +331,32 @@ class TUIApplication:
         self._show_text("Execution logs", "\n".join(lines))
 
     def _handle_export(self) -> None:
-        action = self.actions.get("export")
-        if not action:
-            self._show_text("Export rendered SQL", "No export handler is configured.")
-            return
-        export_dir = self._prompt("Export directory (default=target_dir)", self.config["project"].get("target_dir") or "output")
-        output = self._capture_output(
-            action,
-            self.config,
-            export_dir=export_dir,
-            only_selected=self._prompt_yes_no("Export only selected assets?", True),
-            changed_only=self._prompt_yes_no("Export only assets marked as changed?", False),
-        )
-        self._show_text("Export rendered SQL", output or "Done")
+        while True:
+            choice = self._menu(
+                "Export / Apply",
+                ["Export to files", "Apply to target DB", "Back"],
+            )
+            if choice is None or choice == 2:
+                return
+            if choice == 0:
+                action = self.actions.get("export")
+                if not action:
+                    self._show_text("Export rendered SQL", "No export handler is configured.")
+                    return
+                export_dir = self._prompt(
+                    "Export directory (default=target_dir)",
+                    self.config["project"].get("target_dir") or "output",
+                )
+                output = self._capture_output(
+                    action,
+                    self.config,
+                    export_dir=export_dir,
+                    only_selected=self._prompt_yes_no("Export only selected assets?", True),
+                    changed_only=self._prompt_yes_no("Export only assets marked as changed?", False),
+                )
+                self._show_text("Export rendered SQL", output or "Done")
+            elif choice == 1:
+                self._handle_apply()
 
     def _handle_apply(self) -> None:
         action = self.actions.get("apply")
