@@ -105,9 +105,12 @@ class TUIApplication:
         choice = self._prompt(f"{prompt} (y/n)", "y" if default else "n").lower()
         return choice.startswith("y")
 
-    def _show_text(self, title: str, text: str) -> None:
+    def _show_text(
+        self, title: str, text: str, footer: Optional[str] = None
+    ) -> None:
         lines = text.splitlines() or ["<empty>"]
         offset = 0
+        footer = footer or "Press q to go back (↑/↓ to scroll)"
         while True:
             self.stdscr.clear()
             height, width = self.stdscr.getmaxyx()
@@ -116,7 +119,7 @@ class TUIApplication:
             self.stdscr.addstr(1, 2, title[: width - 4])
             for idx, line in enumerate(window):
                 self.stdscr.addstr(3 + idx, 2, line[: width - 4])
-            self.stdscr.addstr(height - 1, 2, "Use ↑/↓ to scroll, q to close")
+            self.stdscr.addstr(height - 1, 2, footer[: width - 4])
             self.stdscr.refresh()
             key = self.stdscr.getch()
             if key in (curses.KEY_UP, ord('k')) and offset > 0:
@@ -190,37 +193,53 @@ class TUIApplication:
             ],
         )
         output = self._capture_output(action, self.config)
-        self._show_text("Metadata collection finished", output or "Done")
+        self._show_text(
+            "Metadata collection finished", output or "Done", footer="Done. Press q to return."
+        )
 
     def _show_metadata_browser(self) -> None:
         schemas = [row["schema_name"] for row in self.db.list_schemas()]
         if not schemas:
             self._show_text("Metadata", "No schemas are stored yet. Run metadata collection first.")
             return
-        schema_idx = self._menu("Select a schema", schemas, allow_quit=False)
-        if schema_idx in (self.BACK, None):
-            return
-        schema = schemas[schema_idx]
-        objects = self.db.list_schema_objects(schema)
-        if not objects:
-            self._show_text("Metadata", "No objects are stored under this schema.")
-            return
-        labels = [f"{row['obj_type']}: {row['obj_name']}" for row in objects]
-        obj_idx = self._menu(f"{schema} objects", labels, allow_quit=False)
-        if obj_idx in (self.BACK, None):
-            return
-        detail = self.db.get_object_detail(schema, objects[obj_idx]["obj_name"], objects[obj_idx]["obj_type"])
-        if not detail:
-            self._show_text("Object detail", "Unable to find object detail.")
-            return
-        body_parts = [f"Schema: {schema}", f"Name: {detail['obj_name']}", f"Type: {detail['obj_type']}"]
-        ddl = detail["ddl_script"]
-        source_code = detail["source_code"]
-        if ddl:
-            body_parts.append("\n[DDL]\n" + ddl)
-        if source_code:
-            body_parts.append("\n[Source]\n" + source_code)
-        self._show_text("Object detail", "\n".join(body_parts))
+        while True:
+            schema_idx = self._menu("Select a schema", schemas, allow_quit=False)
+            if schema_idx in (self.BACK, None):
+                return
+
+            schema = schemas[schema_idx]
+            objects = self.db.list_schema_objects(schema)
+            if not objects:
+                self._show_text("Metadata", "No objects are stored under this schema.")
+                continue
+
+            labels = [f"{row['obj_type']}: {row['obj_name']}" for row in objects]
+            while True:
+                obj_idx = self._menu(
+                    f"{schema} objects", labels + ["Back"], allow_quit=False
+                )
+                if obj_idx in (self.BACK, None) or obj_idx == len(labels):
+                    break
+
+                detail = self.db.get_object_detail(
+                    schema, objects[obj_idx]["obj_name"], objects[obj_idx]["obj_type"]
+                )
+                if not detail:
+                    self._show_text("Object detail", "Unable to find object detail.")
+                    continue
+
+                body_parts = [
+                    f"Schema: {schema}",
+                    f"Name: {detail['obj_name']}",
+                    f"Type: {detail['obj_type']}",
+                ]
+                ddl = detail["ddl_script"]
+                source_code = detail["source_code"]
+                if ddl:
+                    body_parts.append("\n[DDL]\n" + ddl)
+                if source_code:
+                    body_parts.append("\n[Source]\n" + source_code)
+                self._show_text("Object detail", "\n".join(body_parts))
 
     def _handle_porting(self) -> None:
         mode_choice = self._menu("Choose a porting mode", ["FAST (sqlglot)", "FULL (LLM+RAG)", "Back"], allow_quit=False)
@@ -379,7 +398,9 @@ class TUIApplication:
                     only_selected=self._prompt_yes_no("Export only selected assets?", True),
                     changed_only=self._prompt_yes_no("Export only assets marked as changed?", False),
                 )
-                self._show_text("Export rendered SQL", output or "Done")
+                self._show_text(
+                    "Export rendered SQL", output or "Done", footer="Done. Press q to return."
+                )
             elif choice == 1:
                 self._handle_apply()
 
@@ -394,7 +415,9 @@ class TUIApplication:
             only_selected=self._prompt_yes_no("Apply only selected assets?", True),
             changed_only=self._prompt_yes_no("Apply only assets marked as changed?", False),
         )
-        self._show_text("Apply rendered SQL", output or "Done")
+        self._show_text(
+            "Apply rendered SQL", output or "Done", footer="Done. Press q to return."
+        )
 
     def _handle_quality(self) -> None:
         action = self.actions.get("quality")
@@ -402,4 +425,6 @@ class TUIApplication:
             self._show_text("Quality checks", "No quality-check handler is configured.")
             return
         output = self._capture_output(action, self.config)
-        self._show_text("Quality check results", output or "Done")
+        self._show_text(
+            "Quality check results", output or "Done", footer="Done. Press q to return."
+        )
