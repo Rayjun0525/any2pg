@@ -38,11 +38,11 @@ class TUIApplication:
             choice = self._menu(
                 "Any2PG | Database Migration Assistant",
                 [
-                    "메타정보 수집 (Metadata collection)",
-                    "런 포팅 (Run/Resume porting)",
-                    "상태 확인 (Status & browse)",
-                    "익스포트 (Export/Apply)",
-                    "종료 (Quit)",
+                    "Collect metadata",
+                    "Run/Resume porting",
+                    "View status",
+                    "Export or apply",
+                    "Quit",
                 ],
                 allow_quit=True,
             )
@@ -242,7 +242,11 @@ class TUIApplication:
                 self._show_text("Object detail", "\n".join(body_parts))
 
     def _handle_porting(self) -> None:
-        mode_choice = self._menu("Choose a porting mode", ["FAST (sqlglot)", "FULL (LLM+RAG)", "Back"], allow_quit=False)
+        mode_choice = self._menu(
+            "Choose a porting mode",
+            ["FAST (sqlglot)", "FULL (LLM+RAG)", "Back"],
+            allow_quit=False,
+        )
         if mode_choice in (self.BACK, None) or mode_choice == 2:
             return
         self.config.setdefault("llm", {})["mode"] = "fast" if mode_choice == 0 else "full"
@@ -253,11 +257,11 @@ class TUIApplication:
 
         if mode_choice == 0:
             mode_summary = (
-                "sqlglot 기반 단일 변환 → SQLite 저장 후 종료. 검증/재시도 없이 빠른 초안만 남깁니다."
+                "Single-pass sqlglot conversion → Stored in SQLite only. Produces a quick draft without review or retries."
             )
         else:
             mode_summary = (
-                "sqlglot 1차 변환 → SQLite 저장 → 랭그래프 검수/검증 → 실패 시 변환 에이전트 재시도 후 검수 재진행."
+                "sqlglot conversion → SQLite storage → LangGraph review/verification → Converter retries when verification fails."
             )
 
         # Simple run using config defaults; optional filters stay hidden unless requested.
@@ -268,7 +272,9 @@ class TUIApplication:
         if use_filters:
             only_selected = self._prompt_yes_no("Process only assets marked as selected?", True)
             changed_only = self._prompt_yes_no("Process only assets flagged as changed?", False)
-            names_raw = self._prompt("Specific file names (comma-separated, leave empty for all)", "").strip()
+            names_raw = self._prompt(
+                "Specific file names (comma-separated, leave empty for all)", ""
+            ).strip()
             asset_names = {n.strip() for n in names_raw.split(',') if n.strip()} if names_raw else None
 
         self._show_status_banner(
@@ -276,7 +282,7 @@ class TUIApplication:
             [
                 "Running migration using config defaults.",
                 mode_summary,
-                "상태는 SQLite에 남으므로 강제 종료되어도 재시작 시 이어집니다.",
+                "Progress is stored in SQLite so you can resume after interruptions.",
             ],
         )
         output = self._capture_output(
@@ -301,16 +307,16 @@ class TUIApplication:
         lines = [
             f"Project: {self.project_name}",
             f"Version: {self.project_version}",
-            "SQLite에 저장된 단계별 상태를 기반으로 언제든 재개할 수 있습니다.",
+            "You can resume based on the stepwise status stored in SQLite.",
             "",
         ]
         status_labels = {
-            "PENDING": "대기/변환 준비",
-            "REVIEW_PASS": "검수 통과",
-            "REVIEW_FAIL": "검수 미통과 (재변환 필요)",
-            "VERIFY_FAIL": "검증 실패",
-            "DONE": "검증 완료",
-            "FAILED": "실패",
+            "PENDING": "Pending / queued",
+            "REVIEW_PASS": "Review passed",
+            "REVIEW_FAIL": "Review failed (needs retry)",
+            "VERIFY_FAIL": "Verification failed",
+            "DONE": "Verification completed",
+            "FAILED": "Failed",
         }
         if progress:
             lines.append("[Conversion status]")
@@ -328,7 +334,7 @@ class TUIApplication:
                 lines.append(
                     f"{row['file_name']} :: {row['status']} (verified={row['verified']})"
                 )
-            lines.append("- 상세 내용은 'Converted SQL preview'에서 확인하세요.")
+            lines.append("- Open 'Converted SQL preview' for full content.")
         self._show_text("Porting status", "\n".join(lines))
 
     def _show_converted_outputs(self) -> None:
