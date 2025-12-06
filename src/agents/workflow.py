@@ -5,7 +5,7 @@ import re
 from typing import Optional, TypedDict
 
 import sqlglot
-from langchain_community.chat_models import ChatOllama
+from langchain_ollama.chat_models import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
@@ -129,6 +129,16 @@ class MigrationWorkflow:
     def verifier_node(self, state: AgentState):
         logger.info(f"[{state['file_path']}] Verifying in DB...")
 
+        if state.get("status") == "FAILED":
+            error_msg = state.get("error_msg") or "Transpilation failed"
+            logger.error("[%s] Skipping verification due to earlier failure: %s", state["file_path"], error_msg)
+            return {
+                "status": "FAILED",
+                "error_msg": error_msg,
+                "skipped_statements": state.get("skipped_statements", []),
+                "executed_statements": state.get("executed_statements", 0),
+            }
+
         result = self.verifier.verify_sql(state["target_sql"])
 
         if result.success:
@@ -151,9 +161,16 @@ class MigrationWorkflow:
         context = state.get("rag_context")
         schema_refs = state.get("schema_refs") or []
         if not context:
-            ctx_result = self.rag.build_context(state["source_sql"])
-            context = ctx_result.context
-            schema_refs = sorted(ctx_result.referenced_schemas)
+            try:
+                ctx_result = self.rag.build_context(state["source_sql"])
+                context = ctx_result.context
+                schema_refs = sorted(ctx_result.referenced_schemas)
+            except Exception as ctx_err:
+                logger.warning(
+                    "[%s] Failed to build context during conversion: %s",
+                    state["file_path"],
+                    ctx_err,
+                )
 
         prompt = CONVERTER_SYSTEM_PROMPT.format(
             rag_context=context,
