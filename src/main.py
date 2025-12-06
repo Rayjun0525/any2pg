@@ -274,6 +274,7 @@ def run_migration(
     asset_names: Optional[Iterable[str]] = None,
 ):
     """Execute the migration workflow for pending SQL files."""
+    summary_messages = []
     source_dir = config['project'].get('source_dir')
     target_dir = config['project'].get('target_dir')
     db_path = config['project']['db_file']
@@ -314,9 +315,12 @@ def run_migration(
     
     assets = db.list_source_assets(only_selected=only_selected, only_changed=changed_only)
     if not assets:
-        logger.warning(
-            "No SQL assets registered in SQLite; populate source_assets via --init, manual inserts, or enabling auto_ingest_source_dir",
+        message = (
+            "No SQL assets registered in SQLite. Run --init or enable auto_ingest_source_dir "
+            "to ingest source files before porting."
         )
+        logger.warning(message)
+        print(message)
         return
 
     allowed_names = {a['file_name'] for a in assets}
@@ -344,7 +348,9 @@ def run_migration(
     logger.debug("Pending assets: %s", ", ".join(a["file_name"] for a in pending_assets))
 
     if not pending_assets:
-        logger.info("All assets are already marked DONE and unchanged; nothing to process.")
+        message = "All assets are already marked DONE with no detected changes."
+        logger.info(message)
+        print(message)
         return
     
     done, failed = 0, 0
@@ -440,12 +446,14 @@ def run_migration(
             logger.exception("[%s] Critical error processing file", file_name)
             failed += 1
 
-    logger.info(
-        "Run summary: %s succeeded, %s failed/incomplete out of %s pending assets",
-        done,
-        failed,
-        len(pending_assets),
+    summary_line = (
+        "Run summary: "
+        f"{done} succeeded, {failed} failed/incomplete out of {len(pending_assets)} pending assets"
     )
+    logger.info(summary_line)
+    summary_messages.append(summary_line)
+    summary_messages.append("Results are recorded in SQLite for status and preview screens.")
+    print("\n".join(summary_messages))
     _record_event(
         config,
         db,
