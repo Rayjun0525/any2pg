@@ -19,14 +19,14 @@ logging:
 database:
   source:
     type: "oracle" # oracle, mysql, mssql, db2 ...
-    connection_string: "oracle+cx_oracle://user:password@localhost:1521/?service_name=ORCL"
+    uri: "oracle+oracledb://user:password@localhost:1521/?service_name=ORCL"
     # List of schemas to extract. Leave empty or remove to extract default schema only.
     schemas: 
       - "HR"
       - "SCOTT"
 
   target:
-    connection_string: "postgresql+psycopg://postgres:password@localhost:5432/target_db"
+    uri: "postgresql+psycopg://postgres:password@localhost:5432/target_db"
     target_schema: "public"
 
 llm:
