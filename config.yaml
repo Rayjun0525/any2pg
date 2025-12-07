@@ -1,10 +1,20 @@
-general:
-  project_name: "my_migration_project"
-  log_path: "logs/any2pg.log"
-  log_level: "INFO"
-  mode: "cli" # tui, cli
-  metadata_path: "data/project.db"
+project:
+  name: "my_migration_project"
+  version: "1.0.0"
+  db_file: "data/project.db"
   max_retries: 3
+  source_dir: ""   # Optional: for auto-ingesting .sql files
+  target_dir: "output"
+  auto_ingest_source_dir: false
+  mirror_outputs: false
+  silent_mode: false
+
+logging:
+  level: "INFO"
+  file: "logs/any2pg.log"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  max_bytes: 1048576
+  backup_count: 3
 
 database:
   source:
