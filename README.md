@@ -1,150 +1,329 @@
 # Any2PG
 
-Hybrid SQL migration toolkit that converts heterogeneous SQL (Oracle/MySQL/etc.) to PostgreSQL, validates the output, and captures metadata for context-aware fixes. Read this README end-to-end to install, configure, and operate the tool without additional references.
+[한국어](README_KR.md) | **English**
 
-## 1) What Any2PG Does
-- Multi-stage pipeline: SQLGlot transpile ➜ LLM review/patch ➜ PostgreSQL verification with forced `ROLLBACK`.
-- Resume-friendly processing: SQLite keeps file status so reruns skip finished items.
-- Metadata-driven RAG: per-schema objects cached in SQLite for precise context retrieval.
-- Config-first control: logging, adapters, verification options, and LLM settings are all driven by YAML.
+A hybrid SQL migration toolkit that converts heterogeneous SQL (Oracle/MySQL/MSSQL/etc.) to PostgreSQL with AI-powered review and verification.
 
-## 2) Architecture at a Glance
-- **CLI (src/main.py):** `--init`, `--run`, `--reset-logs`, plus `--config`, `--db-file`, `--log-level`, and `--log-file` overrides.
-- **Extractor (src/modules/metadata_extractor.py):** walks configured schemas via adapter instances, stores results in SQLite (`schema_objects`, `migration_logs`).
-- **RAG Context Builder (src/modules/context_builder.py):** parses SQL with SQLGlot, fetches related objects by name + schema from SQLite.
-- **Workflow (src/agents/workflow.py):** LangGraph-driven state machine for transpile ➜ review ➜ verify ➜ corrective rewrite.
-- **Verifier (src/modules/postgres_verifier.py):** executes statements on PostgreSQL with `autocommit=False` and unconditional rollback; shims live in `src/context_builder_shim.py` and `src/postgres_verifier_shim.py` for legacy imports.
-- **TUI (src/ui/tui.py):** curses-based menu launched by default (when `--mode` is omitted) to drive metadata collection/browsing, porting/resume, export/apply, logs, and quality checks.
+## 🎯 Key Features
 
-## 3) Supported Source Adapters
-| Source DB       | Config `database.source.type` | Adapter Path                      | Extracts Tables/Views | Extracts Routines |
-|-----------------|-------------------------------|-----------------------------------|-----------------------|-------------------|
-| Oracle          | `oracle`                      | `src/modules/adapters/oracle.py`  | ✅ via SQLAlchemy inspector | ✅ via `USER_SOURCE` aggregation |
-| MySQL/MariaDB   | `mysql` / `mariadb`           | `src/modules/adapters/mysql.py`   | ✅ via SQLAlchemy inspector | ✅ via `information_schema.ROUTINES` |
-| Microsoft SQL Server | `mssql`                  | `src/modules/adapters/mssql.py`   | ✅ (`dbo` default)     | ✅ via `sys.objects`/`sys.sql_modules` |
-| IBM DB2         | `db2`                         | `src/modules/adapters/db2.py`     | ✅ (uppercased schema) | ✅ via `SYSCAT.ROUTINES` |
-| SAP HANA        | `hana`                        | `src/modules/adapters/hana.py`    | ✅ via inspector       | ✅ via `SYS.PROCEDURES` |
-| Snowflake       | `snowflake`                   | `src/modules/adapters/snowflake.py` | ✅ via inspector     | ✅ via `information_schema.routines` |
-| MongoDB         | `mongodb`                     | `src/modules/adapters/mongodb.py` | ✅ collections as tables | 🚫 (not supported) |
+- **Multi-stage Pipeline**: SQLGlot auto-conversion ➜ LLM review/fix ➜ PostgreSQL verification (auto-rollback)
+- **Resume-friendly Processing**: SQLite-based state management for interruptible workflows
+- **Metadata-driven RAG**: Schema-aware context for precise SQL conversions
+- **K9s-style TUI**: Intuitive terminal UI for visual workflow management
+- **Config-first Control**: YAML-based configuration for all operations
 
-> Tip: Unknown adapters raise `ValueError`; add new implementations under `src/modules/adapters/` by subclassing `BaseDBAdapter`.
+## 🏗️ Architecture
 
-## 4) End-to-End Workflow
-1. **Metadata mode (`--mode metadata` or `--init`)**: connects to the source DB, extracts configured schemas, caches metadata in SQLite. Extraction uses only inspector/read queries—source DBs are never mutated.
-2. **Port mode (`--mode port` or `--run`, default)**: works *from SQLite first*. SQL files are optionally ingested from `project.source_dir` into `source_assets` (disabled by `project.auto_ingest_source_dir: false`) and every downstream step consumes rows from SQLite. Converted SQL is stored back into `rendered_outputs`; set `project.mirror_outputs: true` if you still want files mirrored to `project.target_dir`. Dangerous statements (DROP/INSERT/etc.) and procedure calls are skipped unless explicitly allowed in `verification.*`.
-3. **Report mode (`--mode report`)**: prints the conversion report from SQLite filtered by `project.name` and optional schema/status filters so you can review skipped statements and retry counts.
-4. **Reset logs (`--reset-logs`)**: clears `migration_logs` for the current `project.name` to reprocess files.
-5. **Resilience**: reruns skip rows marked `DONE`; retries stop once `project.max_retries` is reached.
-
-## 5) Quickstart (TUI-first)
-```bash
-# 0) Install deps
-python -m pip install -r requirements.txt
-
-# 1) Copy the sample config and adjust connection URIs/schemas
-cp sample/config.sample.yaml ./config.yaml
-
-# 2) Launch the TUI (default) and follow the menus
-python src/main.py --config config.yaml
-
-# 3) CLI equivalents remain available if you prefer scripted runs
-python src/main.py --mode metadata --config config.yaml --db-file "./project_A.db" --log-level DEBUG
-python src/main.py --mode port --config config.yaml --db-file "./project_A.db"
-python src/main.py --mode report --config config.yaml --schema-filter HR
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Any2PG Migration Pipeline                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1️⃣ Metadata Collection                                     │
+│  Source DB ─► SQLAlchemy Inspector ─► SQLite (schema_objects) │
+│  (Tables, Views, Indexes, Procedures, Functions, Triggers) │
+│                                                             │
+│  2️⃣ Conversion Mode Selection                               │
+│  ┌─────────────┐         ┌───────────────────┐             │
+│  │ FAST Mode   │         │ AGENT Mode (LLM)  │             │
+│  │ SQLGlot only│         │ Review ↔ Convert  │             │
+│  └─────────────┘         └───────────────────┘             │
+│         │                        │                         │
+│         └────────┬───────────────┘                         │
+│                  ↓                                         │
+│  3️⃣ Verification (PostgreSQL)                               │
+│  BEGIN ─► Execute ─► ROLLBACK (Safe verification)          │
+│                  ↓                                         │
+│  4️⃣ Result Storage                                          │
+│  SQLite (rendered_outputs) + File export (optional)        │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## 6) Interactive TUI workflow (default launch)
-1. **Start the app**: `python src/main.py --config config.yaml` shows the banner with the configured `project.name`/`project.version`.
-2. **Collect metadata**: choose *Collect metadata* to connect to `database.source` and persist schemas + DDL into SQLite (`schema_objects`).
-3. **Status & browse**: the *Status & browse* area groups **Metadata overview** (schemas → objects → DDL/source), **Porting status** (counts + latest rendered outputs), and **Execution logs** (especially useful with `project.silent_mode`/`--silent`).
-4. **Run/Resume porting**: pick *Run/Resume porting*, then choose **FAST** (sqlglot + verifier) or **FULL** (LLM+RAG) mode. Advanced filters are optional; the default run uses the YAML config as-is and simply streams progress.
-5. **Pause/Resume**: if processing stops mid-way, rerun the same menu; only assets not marked `DONE` (or whose hashes changed) will resume.
-6. **Export/Apply**: use *Export rendered SQL* to write outputs to disk or *Apply rendered SQL* to push them to the target DB.
-7. **Quality checks**: run built-in quality gates directly from the menu.
-8. **Silent mode**: enable `project.silent_mode: true` or pass `--silent` to write execution events to SQLite while keeping stdout quiet.
-9. **Navigation**: move with ↑/↓, go back with ←, and select with → or Enter (ESC also closes a menu).
+## 📦 Installation
 
-## 7) Configuration Reference (config.yaml)
+```bash
+# 1. Clone repository
+git clone https://github.com/your-repo/any2pg.git
+cd any2pg
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Prepare configuration
+cp sample/config.sample.yaml config.yaml
+# Edit config.yaml with your DB connection details
+```
+
+### Oracle Driver Selection
+
+For Oracle DB sources, choose one:
+
+**Option 1: oracledb (Recommended)** - Pure Python driver
+```bash
+pip install oracledb  # Already in requirements.txt
+```
+
+**Option 2: cx_Oracle** - Native driver (requires Oracle Instant Client + C++ Build Tools)
+```bash
+# Uncomment cx_Oracle in requirements.txt, then:
+pip install cx_Oracle
+```
+
+## 🚀 Quick Start
+
+### TUI Mode (Recommended)
+
+```bash
+python src/main.py --config config.yaml
+```
+
+Launches K9s-style interactive UI:
+- **Left pane**: Asset (SQL files) list
+- **Right pane**: Detail view (Info / SQL / Logs tabs)
+- **Navigation**: ↑↓ to move, ←→ to switch tabs, Space to toggle selection
+
+### CLI Mode
+
+```bash
+# 1. Collect metadata
+python src/main.py --mode metadata
+
+# 2. Run conversion
+python src/main.py --mode port
+
+# 3. Check status
+python src/main.py --mode status
+
+# 4. Export results
+python src/main.py --mode export
+
+# 5. Apply to target DB
+python src/main.py --mode apply
+```
+
+## ⚙️ Configuration (config.yaml)
+
 ```yaml
-project:
-  name: "example_project"        # Project label used to scope all SQLite rows and reports
-  version: "0.1.0"               # Optional banner/version string shown in the TUI header
-  source_dir: ""                   # Optional: set only when you want auto-ingest from a filesystem folder
-  target_dir: ""                   # Optional mirror location used when mirror_outputs is true
-  db_file: "./migration.db"        # Default SQLite path (override via --db-file)
-  max_retries: 5                    # Stop correction loop after this many failures
-  auto_ingest_source_dir: false     # Disabled by default; enable to pull .sql files from source_dir into SQLite
-  mirror_outputs: false             # If true, also write rendered SQL files to target_dir in addition to SQLite
-  silent_mode: false                # When true, suppress stdout and store execution logs in SQLite (override with --silent)
-
-logging:
-  level: "INFO"                     # DEBUG, INFO, WARNING, ERROR
-  module_levels:                    # Optional per-module overrides for deep tracing
-    agents.workflow: "DEBUG"
-    modules.context_builder: "DEBUG"
-  file: "./any2pg.log"             # Empty string logs to console only
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  max_bytes: 1048576                # Rotate after ~1MB
-  backup_count: 3                   # How many rotated files to keep
+general:
+  project_name: "my_project"
+  log_path: "logs/any2pg.log"
+  log_level: "INFO"
+  mode: "cli"  # cli or tui
+  metadata_path: "data/project.db"
+  max_retries: 3
 
 database:
   source:
-    type: "oracle"                 # See adapter table above
-    uri: "oracle+oracledb://user:pass@host:1521/?service_name=xe"
-    schemas: ["HR", "SCOTT"]       # Schema list; omit to use DB defaults
+    type: "oracle"  # oracle, mysql, mssql, db2, etc.
+    connection_string: "oracle+oracledb://user:pass@host:1521/?service_name=xe"
+    schemas:
+      - "HR"
+      - "SCOTT"
+  
   target:
-    type: "postgres"
-    uri: "postgresql://user:pass@localhost:5432/postgres"
-    statement_timeout_ms: 5000      # Optional PG statement_timeout during verification
+    connection_string: "postgresql://user:pass@localhost:5432/target_db"
+    target_schema: "public"
 
 llm:
-  mode: "full"                   # fast | full — fast = transpile+verify only; full adds LLM review and fixes
-  provider: "ollama"               # Interface handled by LangChain
-  model: "gemma:7b"
+  provider: "ollama"
+  model: "llama3"
   base_url: "http://localhost:11434"
-  temperature: 0.1
-
-verification:
-  mode: "port"                    # metadata | port | report (defaults to porting)
-  allow_dangerous_statements: false  # If true, run DDL/DML during verification (still inside BEGIN/ROLLBACK)
-  allow_procedure_execution: false   # If true, execute CALL/DO/EXECUTE during verification
-
-rules:                                # Free-form guidance strings for the reviewer
-  - "Convert Oracle NVL to COALESCE."
-  - "Replace SYSDATE with CURRENT_TIMESTAMP."
+  mode: "fast"  # fast (sqlglot only) or agent (LLM-powered)
 ```
 
-## 8) SQLite Schema
-- **schema_objects**: `obj_id` (PK), `project_name`, `schema_name`, `obj_name`, `obj_type`, `ddl_script`, `source_code`, `extracted_at`. Uniqueness on `(project_name, schema_name, obj_name, obj_type)`.
-- **migration_logs / report source**: `project_name`, `file_path`, `detected_schemas`, `status`, `retry_count`, `last_error_msg`, `target_path`, `skipped_statements`, `executed_statements`, `updated_at`. Unique on `(project_name, file_path)` so multiple projects can reuse one SQLite file.
-  - `detected_schemas` is derived from parsed SQL references so reports can be filtered by schema lineage without cross-project collisions.
+## 🎨 K9s-Style TUI Usage
 
-## 9) Sample Assets
-- `sample/config.sample.yaml`: ready-to-copy baseline with Oracle➜Postgres defaults.
-- `sample/queries/*.sql`: three test queries (simple select, join+decode, function call) to validate the workflow. Copy them into `./input` for a dry run.
+### Main Screen
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Any2PG v1.0 | Project: my_project                           │
+├──────────────────┬───────────────────────────────────────────┤
+│ Asset List       │ Detail View                               │
+├──────────────────┼───────────────────────────────────────────┤
+│ [X] table1.sql   │ Tab: Info | SQL | Logs                   │
+│ [ ] table2.sql   │                                           │
+│ [X] proc1.sql    │ File: table1.sql                         │
+│                  │ Selected: True                            │
+│                  │ Status: DONE                              │
+│                  │ Extracted: 2025-12-07 15:30:00           │
+└──────────────────┴───────────────────────────────────────────┘
+ Tab: Info | Space: toggle select | q: quit
+```
 
-## 10) Logging & Troubleshooting
-- Tuning: adjust `logging.level` for verbosity or override via `--log-level` (or `ANY2PG_LOG_LEVEL`). File output path can be set per run with `--log-file` (`ANY2PG_LOG_FILE`) or in YAML; parent directories are created automatically when needed.
-- Targeted tracing: use `logging.module_levels` to crank up only the noisy components (e.g., `agents.workflow` for stage-by-stage traces, `modules.context_builder` for context queries).
-- Silent runs: set `project.silent_mode: true` or pass `--silent` to suppress stdout and capture execution events into SQLite (`execution_logs`). Open *Progress & logs* in the TUI to read them.
-- Verification safety: verifier wraps execution in explicit `BEGIN`/`ROLLBACK`; dangerous DDL/DML and procedure calls are skipped unless `verification.allow_dangerous_statements` / `verification.allow_procedure_execution` are enabled. Statement timeout is configurable. Data parity is **not** auto-checked—compare source/target data manually after review.
-- Adapter issues: most adapters rely on SQLAlchemy inspectors; missing dialect drivers will raise import/connection errors—install the correct driver for your source DB.
-- Resume logic: if a file remains in `FAILED`/`VERIFY_FAIL`, inspect `migration_logs.last_error_msg` and increase `project.max_retries` if needed.
-- Config validation: startup enforces required keys (`project.*`, `database.{source,target}.uri`, `llm.*`) and rejects `max_retries < 1` so misconfigured runs fail fast with actionable errors.
-- Deterministic context: the RAG context builder orders schema objects consistently (`schema_name`, `obj_type`, `obj_name`) so reviewer prompts are reproducible across runs.
-- Reporting: `--mode report --schema-filter HR` prints SQLite-backed results for the active `project.name` (no cross-project leakage) including skipped statements and retry counts.
+### Key Bindings
+- `↑/↓` or `j/k`: Navigate asset list
+- `←/→` or `h/l`: Switch tabs
+- `Space`: Toggle asset selection
+- `q` or `ESC`: Quit
 
-## 11) Quality Gates & Testing
-- Defensive config validation (paths expanded, retries coerced to integer, required keys enforced) guards against accidental misconfiguration.
-- SQLite operations are fully transactional—write operations roll back on errors to avoid partially persisted metadata.
-- RAG context builder ignores unparsable SQL safely and only emits objects that provide DDL/source text.
-- Run the full suite locally with `python -m pytest`; set `POSTGRES_TEST_DSN` to enable live PostgreSQL smoke tests.
+## 📋 Supported Source Databases
 
-## 12) Developer Notes
-- Primary code lives under `src/modules/` (metadata_extractor, context_builder, postgres_verifier, adapters). LangGraph workflow and prompts sit under `src/agents/`.
-- Backward compatibility shims: `src/context_builder_shim.py` and `src/postgres_verifier_shim.py` re-export their implementations—new code should import from `src/modules/` paths directly.
-- Comments/docstrings and user-facing CLI/TUI messages are written in English for consistency. A Korean README is provided separately (`README_KR.md`).
+| Database | Type Value | Adapter | Tables/Views | Procedures/Functions |
+|----------|------------|---------|--------------|---------------------|
+| Oracle | `oracle` | `oracle.py` | ✅ | ✅ |
+| MySQL/MariaDB | `mysql` | `mysql.py` | ✅ | ✅ |
+| MS SQL Server | `mssql` | `mssql.py` | ✅ | ✅ |
+| IBM DB2 | `db2` | `db2.py` | ✅ | ✅ |
+| SAP HANA | `hana` | `hana.py` | ✅ | ✅ |
+| Snowflake | `snowflake` | `snowflake.py` | ✅ | ✅ |
+| MongoDB | `mongodb` | `mongodb.py` | ✅ | 🚫 |
 
-## 13) Live Database Verification (PostgreSQL / Oracle)
-- PostgreSQL smoke tests: set `POSTGRES_TEST_DSN` (e.g., `postgresql://user:pass@localhost:5432/any2pg_test`) and run `python -m pytest -q` to execute the `tests/integration/test_postgres_live.py` suite. The verifier runs inside a transaction and rolls back every statement.
-- Oracle smoke tests: an Oracle instance is required but not bundled; set `ORACLE_TEST_DSN` and add analogous fixtures before enabling end-to-end Oracle checks.
+## 🔄 Workflow
+
+### 1. Metadata Collection
+```bash
+python src/main.py --mode metadata
+```
+- Connects to source DB and extracts schema information
+- Stores tables, views, indexes, procedures, functions, triggers in SQLite
+- **Read-only**: Never modifies source DB
+
+### 2. Conversion Execution
+
+**FAST Mode** (sqlglot only)
+```yaml
+llm:
+  mode: "fast"
+```
+- Rule-based automatic conversion
+- No LLM cost
+- Fast processing
+
+**AGENT Mode** (LLM-powered)
+```yaml
+llm:
+  mode: "agent"
+```
+- AI-powered conversion and review
+- RAG-enabled context-aware transformation
+- High quality, slower processing
+
+### 3. Verification
+- Safely validates on PostgreSQL with `BEGIN` → Execute → `ROLLBACK`
+- Dangerous statements (DROP, DELETE, etc.) controlled by config
+- Statements requiring transaction control marked with `need_permission` flag
+
+### 4. Application
+```bash
+python src/main.py --mode apply
+```
+- Applies verified SQL to target DB
+- Can filter by selected assets
+
+## 🗄️ SQLite Schema
+
+Key tables:
+
+### schema_objects
+Stores source DB metadata
+- `project_name`, `schema_name`, `obj_name`, `obj_type`
+- `ddl_script`, `source_code`
+
+### source_assets
+SQL files to be converted
+- `file_name`, `file_path`, `sql_text`
+- `selected_for_port`, `analysis_data`
+
+### rendered_outputs
+Conversion results
+- `sql_text`, `status`, `verified`
+- `review_comments`, `need_permission`, `agent_state`
+
+### execution_logs
+Execution logs
+- `level`, `event`, `detail`, `created_at`
+
+## 🧪 Testing
+
+```bash
+# Unit tests
+python -m pytest tests/
+
+# PostgreSQL integration tests (requires real DB)
+export POSTGRES_TEST_DSN="postgresql://user:pass@localhost:5432/test_db"
+python -m pytest tests/integration/
+```
+
+## 🛠️ Developer Guide
+
+### Project Structure
+```
+any2pg/
+├── src/
+│   ├── main.py                    # CLI entry point
+│   ├── modules/
+│   │   ├── sqlite_store.py        # SQLite repository
+│   │   ├── metadata_extractor.py  # Metadata collector
+│   │   ├── context_builder.py     # RAG context builder
+│   │   ├── postgres_verifier.py   # PostgreSQL verification engine
+│   │   └── adapters/               # DB adapters
+│   ├── agents/
+│   │   ├── workflow.py             # LangGraph workflow
+│   │   └── prompts.py              # LLM prompts
+│   └── ui/
+│       └── tui.py                  # K9s-style TUI
+├── config.yaml                     # Configuration
+└── requirements.txt                # Dependencies
+```
+
+### Adding New Adapters
+
+1. Create new file in `src/modules/adapters/`
+2. Inherit from `BaseDBAdapter`
+3. Implement `get_tables_and_views()`, `get_procedures()`
+4. Register in `__init__.py`
+
+## 🔍 Troubleshooting
+
+### Common Issues
+
+**1. Oracle Connection Failure**
+```bash
+# Using oracledb
+pip install oracledb
+
+# Check connection_string format
+oracle+oracledb://user:pass@host:1521/?service_name=xe
+```
+
+**2. LLM Connection Failure**
+```bash
+# Check Ollama server
+curl http://localhost:11434/api/tags
+
+# Download model
+ollama pull llama3
+```
+
+**3. Repeated Conversion Failures**
+```yaml
+general:
+  max_retries: 5  # Increase retry count
+```
+
+### Log Inspection
+
+```bash
+# Enable detailed logging
+python src/main.py --mode port --log-level DEBUG
+
+# View log file
+tail -f logs/any2pg.log
+```
+
+## 📝 License
+
+This project is open source.
+
+## 🤝 Contributing
+
+Bug reports, feature requests, and Pull Requests are welcome!
+
+## 📞 Support
+
+For issues, please create a GitHub Issue.
+
+---
+
+**Made with ❤️ for Database Migration**

@@ -10,8 +10,10 @@ sqlglot>=20.0.0
 # Database Drivers & ORM
 sqlalchemy>=2.0.0
 psycopg[binary]>=3.1.0    # Target DB (PostgreSQL) Driver
-cx_Oracle>=8.3.0          # Source DB (Oracle) Driver
-# oracledb>=2.0.0         # Optional modern replacement for cx_Oracle
+
+# Oracle drivers (choose one based on your environment)
+# cx_Oracle>=8.3.0        # Requires Oracle Instant Client + C++ Build Tools
+oracledb>=2.0.0           # Recommended: pure Python Oracle driver (thick/thin mode)
 
 # Utilities
 pyyaml>=6.0
