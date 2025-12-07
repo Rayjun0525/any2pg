@@ -118,6 +118,9 @@ class DBManager:
             status TEXT,
             verified INTEGER DEFAULT 0,
             last_error TEXT,
+            review_comments TEXT,
+            need_permission INTEGER DEFAULT 0,
+            agent_state TEXT DEFAULT 'GLOTING',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(project_name, file_path)
         );
@@ -232,6 +235,24 @@ class DBManager:
                     "rendered_outputs",
                     "last_error",
                     "ALTER TABLE rendered_outputs ADD COLUMN last_error TEXT",
+                )
+                self._ensure_column(
+                    cursor,
+                    "rendered_outputs",
+                    "review_comments",
+                    "ALTER TABLE rendered_outputs ADD COLUMN review_comments TEXT",
+                )
+                self._ensure_column(
+                    cursor,
+                    "rendered_outputs",
+                    "need_permission",
+                    "ALTER TABLE rendered_outputs ADD COLUMN need_permission INTEGER DEFAULT 0",
+                )
+                self._ensure_column(
+                    cursor,
+                    "rendered_outputs",
+                    "agent_state",
+                    "ALTER TABLE rendered_outputs ADD COLUMN agent_state TEXT DEFAULT 'GLOTING'",
                 )
 
                 self._ensure_column(
@@ -354,6 +375,9 @@ class DBManager:
         status: Optional[str] = None,
         verified: bool = False,
         last_error: Optional[str] = None,
+        review_comments: Optional[str] = None,
+        need_permission: bool = False,
+        agent_state: Optional[str] = None,
     ) -> None:
         content_hash = self._hash_sql(sql_text) if sql_text else None
         file_name = os.path.basename(file_path)
@@ -361,15 +385,18 @@ class DBManager:
             cur.execute(
                 """
                 INSERT INTO rendered_outputs (
-                    project_name, file_name, file_path, sql_text, content_hash, source_hash, status, verified, last_error, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    project_name, file_name, file_path, sql_text, content_hash, source_hash, status, verified, last_error, review_comments, need_permission, agent_state, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(project_name, file_path) DO UPDATE SET
-                    sql_text = excluded.sql_text,
-                    content_hash = excluded.content_hash,
-                    source_hash = excluded.source_hash,
-                    status = excluded.status,
-                    verified = excluded.verified,
-                    last_error = excluded.last_error,
+                    sql_text = COALESCE(excluded.sql_text, rendered_outputs.sql_text),
+                    content_hash = COALESCE(excluded.content_hash, rendered_outputs.content_hash),
+                    source_hash = COALESCE(excluded.source_hash, rendered_outputs.source_hash),
+                    status = COALESCE(excluded.status, rendered_outputs.status),
+                    verified = COALESCE(excluded.verified, rendered_outputs.verified),
+                    last_error = COALESCE(excluded.last_error, rendered_outputs.last_error),
+                    review_comments = COALESCE(excluded.review_comments, rendered_outputs.review_comments),
+                    need_permission = COALESCE(excluded.need_permission, rendered_outputs.need_permission),
+                    agent_state = COALESCE(excluded.agent_state, rendered_outputs.agent_state),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -382,6 +409,9 @@ class DBManager:
                     status,
                     1 if verified else 0,
                     last_error,
+                    review_comments,
+                    1 if need_permission else 0,
+                    agent_state,
                 ),
             )
 
