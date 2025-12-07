@@ -245,22 +245,30 @@ class VerifierAgent:
 
     def _prepare_statements(self, sql_script: str):
         try:
-            statements = self._split_statements(sql_script)
+            # Parse once to get AST nodes
             parsed = sqlglot.parse(sql_script, read="postgres")
-        except ValueError as parse_err:
-            logger.warning("Unable to split SQL script: %s", parse_err)
+        except ParseError as parse_err:
+            logger.warning("Unable to parse SQL script: %s", parse_err)
             return [], [], str(parse_err)
 
         executable: list[str] = []
         skipped: list[str] = []
-        for raw, stmt in zip(statements, parsed):
+
+        for stmt in parsed:
+            if not stmt:
+                continue
+            
+            # Generate the normalized SQL string from the AST node consistent with classification
+            raw_sql = stmt.sql(dialect="postgres")
             classification = self._classify_statement(stmt)
+            
             if classification == "procedure" and not self.allow_procedures:
-                skipped.append(raw)
+                skipped.append(raw_sql)
                 continue
             if classification == "dangerous" and not self.allow_dangerous:
-                skipped.append(raw)
+                skipped.append(raw_sql)
                 continue
-            executable.append(raw)
+            
+            executable.append(raw_sql)
 
         return executable, skipped, None

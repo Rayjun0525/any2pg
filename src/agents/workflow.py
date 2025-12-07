@@ -5,6 +5,7 @@ import re
 from typing import Optional, TypedDict
 
 import sqlglot
+from sqlglot import optimizer
 from langchain_ollama.chat_models import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
@@ -93,9 +94,33 @@ class MigrationWorkflow:
     def transpiler_node(self, state: AgentState):
         logger.info(f"[{state['file_path']}] Transpiling...")
         try:
-            transpiled = sqlglot.transpile(
+            statements = sqlglot.transpile(
                 state["source_sql"], read=self.source_dialect, write=self.target_dialect
-            )[0]
+            )
+            
+            # Use optimizer to clean up the generated SQL
+            optimized_stmts = []
+            for sql in statements:
+                try:
+                    # Optimize specifically for the target dialect
+                    expression = sqlglot.parse_one(sql, read=self.target_dialect)
+                    optimized = optimizer.optimize(
+                        expression, 
+                        schema=None, 
+                        db=None, 
+                        catalog=None,
+                        dialect=self.target_dialect,
+                        rules=[
+                            optimizer.simplify.simplify, 
+                            optimizer.normalize_identifiers.normalize_identifiers
+                        ]
+                    )
+                    optimized_stmts.append(optimized.sql(dialect=self.target_dialect))
+                except Exception as opt_err:
+                    logger.debug("Optimization skipped for statement: %s", opt_err)
+                    optimized_stmts.append(sql)
+
+            transpiled = ";\n".join(optimized_stmts)
             logger.debug(
                 "[%s] Transpile success (source len=%d, target len=%d)",
                 state['file_path'],

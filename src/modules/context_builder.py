@@ -49,15 +49,41 @@ class RAGContextBuilder:
     def _extract_references(self, sql: str) -> Tuple[Set[str], Set[str]]:
         refs: Set[str] = set()
         schema_refs: Set[str] = set()
+        
         try:
+            # Parse all statements in the script
             parsed_statements = sqlglot.parse(sql, read=self.source_dialect)
+            
             for stmt in parsed_statements:
-                for table in stmt.find_all(exp.Table):
-                    if table.name:
-                        refs.add(table.name.upper())
-                    schema_token = getattr(table, "db", None)
-                    if getattr(schema_token, "name", None):
-                        schema_refs.add(schema_token.name.upper())
+                # 1. Use Scope optimizer to distinguish real tables from CTEs/Aliases
+                # build_scope returns the root scope, traverse to find all tables
+                root = sqlglot.optimizer.scope.build_scope(stmt)
+                
+                # If scope build fails (e.g. non-select statement), fall back to walk
+                if not root:
+                    for table in stmt.find_all(exp.Table):
+                        self._add_table_ref(table, refs, schema_refs)
+                else:
+                    # Traverse scopes to find table sources that are NOT CTEs
+                    for scope in root.traverse():
+                        for source in scope.sources.values():
+                            if isinstance(source, exp.Table):
+                                # Check if this table is defined in a CTE (WITH clause)
+                                # scope.ctes contains names defined in this scope
+                                # We also need to check parent scopes for CTEs
+                                table_name = source.name.upper()
+                                is_cte = False
+                                current = scope
+                                while current:
+                                    if table_name in [c.alias_or_name.upper() for c in current.ctes]:
+                                        is_cte = True
+                                        break
+                                    current = current.parent
+                                
+                                if not is_cte:
+                                    self._add_table_ref(source, refs, schema_refs)
+
+                # 2. Extract Function calls (unchanged logic, usually robust enough)
                 for func in stmt.find_all(exp.Func):
                     func_name = func.sql_name() or ""
                     if func_name.upper() == "ANONYMOUS":
@@ -68,9 +94,20 @@ class RAGContextBuilder:
                             func_name = func_root.name
                     if func_name:
                         refs.add(func_name.upper())
+
         except Exception as e:
             logger.warning(f"Failed to parse SQL for RAG context: {e}")
+            
         return refs, schema_refs
+
+    def _add_table_ref(self, table: exp.Table, refs: Set[str], schema_refs: Set[str]):
+        if table.name:
+            refs.add(table.name.upper())
+        # Extract schema if present (db = schema in sqlglot for 3-part, or catalog..table)
+        # Typically table.db is the schema.
+        schema_token = table.args.get("db")
+        if getattr(schema_token, "name", None):
+            schema_refs.add(schema_token.name.upper())
 
     def _fetch_metadata(self, names: Set[str]) -> List[Dict]:
         if not names:

@@ -98,6 +98,7 @@ class DBManager:
             parsed_schemas TEXT,
             selected_for_port INTEGER DEFAULT 1,
             notes TEXT,
+            analysis_data TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(project_name, file_path)
@@ -207,6 +208,12 @@ class DBManager:
                     "notes",
                     "ALTER TABLE source_assets ADD COLUMN notes TEXT",
                 )
+                self._ensure_column(
+                    cursor,
+                    "source_assets",
+                    "analysis_data",
+                    "ALTER TABLE source_assets ADD COLUMN analysis_data TEXT",
+                )
 
                 self._ensure_column(
                     cursor,
@@ -263,6 +270,7 @@ class DBManager:
         parsed_schemas: Optional[str] = None,
         selected_for_port: bool = True,
         override_selection: bool = False,
+        analysis_data: Optional[str] = None,
     ) -> None:
         content_hash = self._hash_sql(sql_text)
         file_name = os.path.basename(file_path)
@@ -271,13 +279,14 @@ class DBManager:
             cur.execute(
                 """
                 INSERT INTO source_assets (
-                    project_name, file_name, file_path, sql_text, content_hash, parsed_schemas, selected_for_port, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    project_name, file_name, file_path, sql_text, content_hash, parsed_schemas, selected_for_port, analysis_data, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(project_name, file_path) DO UPDATE SET
                     sql_text = excluded.sql_text,
                     content_hash = excluded.content_hash,
                     parsed_schemas = COALESCE(excluded.parsed_schemas, source_assets.parsed_schemas),
                     selected_for_port = CASE WHEN ? THEN excluded.selected_for_port ELSE source_assets.selected_for_port END,
+                    analysis_data = COALESCE(excluded.analysis_data, source_assets.analysis_data),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -288,6 +297,7 @@ class DBManager:
                     content_hash,
                     parsed_schemas,
                     selected_flag,
+                    analysis_data,
                     1 if override_selection else 0,
                 ),
             )

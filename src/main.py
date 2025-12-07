@@ -201,7 +201,10 @@ def apply_logging_overrides(config: dict, args: argparse.Namespace) -> None:
         project_conf["silent_mode"] = env_silent.lower() in {"1", "true", "yes"}
 
 
-def _sync_source_dir(db: DBManager, source_dir: str, auto_select: bool = True) -> None:
+from modules.code_analysis import DependencyAnalyzer
+import json
+
+def _sync_source_dir(db: DBManager, source_dir: str, auto_select: bool = True, source_dialect: str = "oracle") -> None:
     """Ingest .sql files from source_dir into SQLite as source_assets."""
 
     if not source_dir:
@@ -225,7 +228,17 @@ def _sync_source_dir(db: DBManager, source_dir: str, auto_select: bool = True) -
         except OSError as exc:
             logger.error("Failed to read %s: %s", file_path, exc)
             continue
-        db.sync_source_asset(file_path, sql_text, selected_for_port=auto_select)
+            
+        # Analyze dependencies
+        analysis = DependencyAnalyzer.analyze(sql_text, dialect=source_dialect)
+        analysis_json = json.dumps(analysis)
+        
+        db.sync_source_asset(
+            file_path, 
+            sql_text, 
+            selected_for_port=auto_select,
+            analysis_data=analysis_json
+        )
 
 
 def _record_event(config: dict, db: DBManager, event: str, detail: Optional[str] = None, level: str = "INFO") -> None:
@@ -251,7 +264,8 @@ def run_init(config):
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
     if config["project"].get("auto_ingest_source_dir", False):
-        _sync_source_dir(db, config["project"]["source_dir"])
+        source_dialect = config["database"]["source"].get("type", "oracle")
+        _sync_source_dir(db, config["project"]["source_dir"], source_dialect=source_dialect)
     _record_event(config, db, "metadata:started", detail=f"source={redact_dsn(source_conf.get('uri', ''))}")
     extractor = MetadataExtractor(config, db)
     extractor.run()
@@ -284,9 +298,9 @@ def run_migration(
 
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
+    source_dialect = source_conf.get('type', 'oracle')
     if auto_ingest:
-        _sync_source_dir(db, source_dir)
-    source_conf = config['database']['source']
+        _sync_source_dir(db, source_dir, source_dialect=source_dialect)
     target_conf = config['database']['target']
     source_dialect = source_conf.get('type', 'oracle')
     rag = RAGContextBuilder(db, source_dialect=source_dialect, project_name=project_name)
@@ -551,8 +565,9 @@ def _list_assets(
     project_name = config['project']['name']
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
+    source_dialect = config["database"]["source"].get("type", "oracle")
     if config["project"].get("auto_ingest_source_dir", True):
-        _sync_source_dir(db, source_dir)
+        _sync_source_dir(db, source_dir, source_dialect=source_dialect)
 
     assets = db.list_source_assets(only_selected=only_selected, only_changed=only_changed)
     if asset_names:
@@ -585,8 +600,9 @@ def _update_selection(config: dict, select: Iterable[str], deselect: Iterable[st
     project_name = config['project']['name']
     db = DBManager(db_path, project_name=project_name)
     db.init_db()
+    source_dialect = config["database"]["source"].get("type", "oracle")
     if config["project"].get("auto_ingest_source_dir", True):
-        _sync_source_dir(db, config['project']['source_dir'])
+        _sync_source_dir(db, config['project']['source_dir'], source_dialect=source_dialect)
     selected = db.set_selection(select, True) if select else 0
     deselected = db.set_selection(deselect, False) if deselect else 0
     if select:
@@ -605,8 +621,9 @@ def _export_outputs(
     project = config['project']
     db = DBManager(project['db_file'], project_name=project['name'])
     db.init_db()
+    source_dialect = config["database"]["source"].get("type", "oracle")
     if config["project"].get("auto_ingest_source_dir", True):
-        _sync_source_dir(db, project['source_dir'])
+        _sync_source_dir(db, project['source_dir'], source_dialect=source_dialect)
 
     assets = db.list_source_assets(only_selected=only_selected, only_changed=changed_only)
     allowed_names = {a['file_name'] for a in assets}
@@ -658,8 +675,9 @@ def _apply_outputs(
     project = config['project']
     db = DBManager(project['db_file'], project_name=project['name'])
     db.init_db()
+    source_dialect = config["database"]["source"].get("type", "oracle")
     if config["project"].get("auto_ingest_source_dir", True):
-        _sync_source_dir(db, project['source_dir'])
+        _sync_source_dir(db, project['source_dir'], source_dialect=source_dialect)
     verifier = VerifierAgent(config)
 
     assets = db.list_source_assets(only_selected=only_selected, only_changed=changed_only)
